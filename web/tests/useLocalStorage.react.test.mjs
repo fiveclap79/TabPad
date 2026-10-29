@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
-import React, { StrictMode } from 'react';
+import React, { StrictMode, act } from 'react';
 import { createRoot } from 'react-dom/client';
-import { act } from 'react-dom/test-utils';
 import { JSDOM } from 'jsdom';
 import { useLocalStorage, validators } from '../src/hooks/useLocalStorage.js';
 
@@ -121,7 +120,7 @@ function mountHookInReact(env, { key, initialValue, validate, initialEditing = f
     });
     React.useLayoutEffect(() => {
       report({ value: val, setValue: setVal, meta, setEditing });
-    });
+    }, [report, val, setVal, meta, setEditing]);
     return React.createElement('div', { 'data-status': meta.status }, JSON.stringify(val));
   }
 

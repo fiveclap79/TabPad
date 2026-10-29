@@ -242,6 +242,8 @@ function mountStorageInstance(tab, key, initialValue, { validate, isEditing = fa
 
   memoB.setEditing(true);
   memoB.setValue('탭 B에서 현재 작성 중인 최신 메모 초안');
+  // 탭 A의 conflict(이전 단계에서 탭 B의 저장으로 인해 발생한 충돌)를 해결한 뒤 탭 A가 새 값을 저장하여 탭 B에 충돌 유발
+  memoA.acceptRemoteValue();
   memoA.setValue('오래된 탭 A에서 뒤늦게 보낸 메모');
 
   assert.equal(memoB.state.storedValue, '탭 B에서 현재 작성 중인 최신 메모 초안');
