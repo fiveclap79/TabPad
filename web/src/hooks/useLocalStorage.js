@@ -39,6 +39,61 @@ export const validators = {
 const TAB_ID = `tab_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 /**
+ * 초기 로컬 스토리지 로드 및 스키마 검증 함수 (useState 지연 초기화 전용)
+ */
+function loadInitialStorageState(key, initialValue, validate) {
+  let loadedValue = initialValue;
+  let loadStatus = 'saved'; // 'saved' | 'error' | 'corrupted' | 'conflict'
+  let loadError = null;
+  let backupKey = null;
+
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw !== null) {
+      try {
+        const parsed = JSON.parse(raw);
+        const isValid = validate ? validate(parsed) : true;
+        if (isValid) {
+          loadedValue = parsed;
+        } else {
+          // 스키마 불일치 손상값: 원본 보존 후 복구 (초기값으로 원본 키를 즉시 덮어쓰지 않음)
+          backupKey = `${key}__corrupted_backup_${Date.now()}`;
+          try {
+            window.localStorage.setItem(backupKey, raw);
+          } catch {
+            // 백업 저장이 실패하더라도 원본 키는 덮어쓰지 않음
+          }
+          loadStatus = 'corrupted';
+          loadError = `저장된 데이터 형식이 손상되어 원본을 '${backupKey}'에 보존하고 기본값으로 복구했습니다.`;
+        }
+      } catch {
+        // JSON 파싱 실패 손상값: 원본 보존 후 복구
+        backupKey = `${key}__corrupted_backup_${Date.now()}`;
+        try {
+          window.localStorage.setItem(backupKey, raw);
+        } catch {
+          // ignore
+        }
+        loadStatus = 'corrupted';
+        loadError = `저장된 JSON 데이터가 손상되어 원본을 '${backupKey}'에 보존하고 기본값으로 복구했습니다.`;
+      }
+    }
+  } catch (err) {
+    loadStatus = 'error';
+    loadError =
+      err?.message || '로컬 스토리지 접근 권한 또는 읽기 오류가 발생했습니다.';
+  }
+
+  return {
+    value: loadedValue,
+    status: loadStatus,
+    error: loadError,
+    backupKey,
+    conflictValue: null,
+  };
+}
+
+/**
  * 강화된 로컬 스토리지 동기화 커스텀 훅
  * - 스키마 검증 및 손상된 원본 데이터 백업 보존 (`${key}__corrupted_backup_${timestamp}`)
  * - 저장 성공/실패/충돌 상태 및 에러 UI 전달 (`status`, `error`, `retrySave`)
@@ -52,62 +107,9 @@ export function useLocalStorage(key, initialValue, options = {}) {
   const { validate, isEditing = false } = options;
   const metaKey = `${key}__meta`;
 
-  // 초기 로드 시 손상 여부 및 백업 키 추적
-  const initialLoadRef = useRef(null);
-  if (initialLoadRef.current === null) {
-    let loadedValue = initialValue;
-    let loadStatus = 'saved'; // 'saved' | 'error' | 'corrupted' | 'conflict'
-    let loadError = null;
-    let backupKey = null;
-
-    try {
-      const raw = window.localStorage.getItem(key);
-      if (raw !== null) {
-        try {
-          const parsed = JSON.parse(raw);
-          const isValid = validate ? validate(parsed) : true;
-          if (isValid) {
-            loadedValue = parsed;
-          } else {
-            // 스키마 불일치 손상값: 원본 보존 후 복구 (초기값으로 원본 키를 즉시 덮어쓰지 않음)
-            backupKey = `${key}__corrupted_backup_${Date.now()}`;
-            try {
-              window.localStorage.setItem(backupKey, raw);
-            } catch (_) {
-              // 백업 저장이 실패하더라도 원본 키는 덮어쓰지 않음
-            }
-            loadStatus = 'corrupted';
-            loadError = `저장된 데이터 형식이 손상되어 원본을 '${backupKey}'에 보존하고 기본값으로 복구했습니다.`;
-          }
-        } catch (parseErr) {
-          // JSON 파싱 실패 손상값: 원본 보존 후 복구
-          backupKey = `${key}__corrupted_backup_${Date.now()}`;
-          try {
-            window.localStorage.setItem(backupKey, raw);
-          } catch (_) {
-            // ignore
-          }
-          loadStatus = 'corrupted';
-          loadError = `저장된 JSON 데이터가 손상되어 원본을 '${backupKey}'에 보존하고 기본값으로 복구했습니다.`;
-        }
-      }
-    } catch (err) {
-      loadStatus = 'error';
-      loadError = err?.message || '로컬 스토리지 접근 권한 또는 읽기 오류가 발생했습니다.';
-    }
-
-    initialLoadRef.current = {
-      value: loadedValue,
-      status: loadStatus,
-      error: loadError,
-      backupKey,
-    };
-  }
-
-  const [storedValue, setStoredValue] = useState(initialLoadRef.current.value);
-  const [status, setStatus] = useState(initialLoadRef.current.status);
-  const [error, setError] = useState(initialLoadRef.current.error);
-  const [conflictValue, setConflictValue] = useState(null);
+  const [state, setState] = useState(() =>
+    loadInitialStorageState(key, initialValue, validate)
+  );
 
   // storage 이벤트로부터 받은 업데이트인지 판별하여 재저장 루프 차단
   const isFromStorageEventRef = useRef(false);
@@ -125,8 +127,11 @@ export function useLocalStorage(key, initialValue, options = {}) {
     (valueToSave) => {
       try {
         if (validate && !validate(valueToSave)) {
-          setStatus('error');
-          setError('유효하지 않은 데이터 형식이어서 저장이 거부되었습니다.');
+          setState((prev) => ({
+            ...prev,
+            status: 'error',
+            error: '유효하지 않은 데이터 형식이어서 저장이 거부되었습니다.',
+          }));
           return false;
         }
         const serialized = JSON.stringify(valueToSave);
@@ -136,15 +141,21 @@ export function useLocalStorage(key, initialValue, options = {}) {
           metaKey,
           JSON.stringify({ updatedAt: now, tabId: TAB_ID })
         );
-        setStatus('saved');
-        setError(null);
-        setConflictValue(null);
+        setState((prev) => ({
+          ...prev,
+          status: 'saved',
+          error: null,
+          conflictValue: null,
+        }));
         return true;
       } catch (err) {
-        setStatus('error');
-        setError(
-          err?.message || '로컬 스토리지 용량 초과 또는 저장 오류가 발생했습니다.'
-        );
+        setState((prev) => ({
+          ...prev,
+          status: 'error',
+          error:
+            err?.message ||
+            '로컬 스토리지 용량 초과 또는 저장 오류가 발생했습니다.',
+        }));
         return false;
       }
     },
@@ -155,9 +166,13 @@ export function useLocalStorage(key, initialValue, options = {}) {
   const setValue = useCallback((valOrUpdater) => {
     isFromStorageEventRef.current = false;
     lastLocalEditTimeRef.current = Date.now();
-    setStoredValue((prev) =>
-      typeof valOrUpdater === 'function' ? valOrUpdater(prev) : valOrUpdater
-    );
+    setState((prev) => ({
+      ...prev,
+      value:
+        typeof valOrUpdater === 'function'
+          ? valOrUpdater(prev.value)
+          : valOrUpdater,
+    }));
   }, []);
 
   // 값 변경 시 자동 저장 (단, 외부 storage 이벤트 수신 시 또는 초기 손상 상태에서는 덮어쓰기 방지)
@@ -165,15 +180,15 @@ export function useLocalStorage(key, initialValue, options = {}) {
     if (isFirstMountRef.current) {
       isFirstMountRef.current = false;
       // 손상된 데이터가 있었던 경우 초기 마운트 시 원본 키를 초기값으로 즉시 덮어쓰지 않음
-      if (initialLoadRef.current.status === 'corrupted') {
+      if (state.status === 'corrupted') {
         return;
       }
       // 기존에 아예 키가 없었던 경우에만 초기값 저장
       try {
         if (window.localStorage.getItem(key) === null) {
-          performSave(storedValue);
+          performSave(state.value);
         }
-      } catch (_) {
+      } catch {
         // ignore
       }
       return;
@@ -185,24 +200,28 @@ export function useLocalStorage(key, initialValue, options = {}) {
       return;
     }
 
-    performSave(storedValue);
-  }, [storedValue, key, performSave]);
+    performSave(state.value);
+  }, [state.value, state.status, key, performSave]);
 
   // 수동 재시도 함수 (저장 실패 또는 충돌/손상 복구 확정 시 현재 입력 내용 강제 저장)
   const retrySave = useCallback(() => {
-    return performSave(storedValue);
-  }, [performSave, storedValue]);
+    return performSave(state.value);
+  }, [performSave, state.value]);
 
   // 충돌 발생 시 다른 탭의 값을 수용하는 함수
   const acceptRemoteValue = useCallback(() => {
-    if (conflictValue !== null) {
+    setState((prev) => {
+      if (prev.conflictValue === null) return prev;
       isFromStorageEventRef.current = true;
-      setStoredValue(conflictValue);
-      setConflictValue(null);
-      setStatus('saved');
-      setError(null);
-    }
-  }, [conflictValue]);
+      return {
+        ...prev,
+        value: prev.conflictValue,
+        conflictValue: null,
+        status: 'saved',
+        error: null,
+      };
+    });
+  }, []);
 
   // 다중 탭 storage 이벤트 리스너
   useEffect(() => {
@@ -214,13 +233,17 @@ export function useLocalStorage(key, initialValue, options = {}) {
         const parsed = JSON.parse(e.newValue);
         if (validate && !validate(parsed)) {
           // 다른 탭에서 손상된 값이 들어온 경우 무시하고 경고 표시
-          setStatus('error');
-          setError('다른 탭에서 유효하지 않은 형식의 데이터가 감지되어 무시했습니다.');
+          setState((prev) => ({
+            ...prev,
+            status: 'error',
+            error:
+              '다른 탭에서 유효하지 않은 형식의 데이터가 감지되어 무시했습니다.',
+          }));
           return;
         }
 
         // 현재 값과 동일하면 무시 (불필요한 리렌더링 및 루프 방지)
-        if (JSON.stringify(parsed) === JSON.stringify(storedValue)) {
+        if (JSON.stringify(parsed) === JSON.stringify(state.value)) {
           return;
         }
 
@@ -234,7 +257,7 @@ export function useLocalStorage(key, initialValue, options = {}) {
               remoteUpdatedAt = parsedMeta.updatedAt;
             }
           }
-        } catch (_) {
+        } catch {
           // ignore
         }
 
@@ -245,45 +268,53 @@ export function useLocalStorage(key, initialValue, options = {}) {
         const isLocalNewer = lastLocalEditTimeRef.current > remoteUpdatedAt;
 
         if (
-          status === 'error' ||
+          state.status === 'error' ||
           isEditingRef.current ||
           isRecentlyEdited ||
           isLocalNewer
         ) {
-          setConflictValue(parsed);
-          setStatus('conflict');
-          setError(
-            '다른 탭에서 변경 사항이 감지되었습니다. 편집 중인 내용을 보호하기 위해 자동 덮어쓰기를 차단했습니다.'
-          );
+          setState((prev) => ({
+            ...prev,
+            conflictValue: parsed,
+            status: 'conflict',
+            error:
+              '다른 탭에서 변경 사항이 감지되었습니다. 편집 중인 내용을 보호하기 위해 자동 덮어쓰기를 차단했습니다.',
+          }));
           return;
         }
 
         // 안전한 경우 외부 탭 변경사항 즉시 반영 (재저장 루프 방지 플래그 설정)
         isFromStorageEventRef.current = true;
-        setStoredValue(parsed);
-        setStatus('saved');
-        setError(null);
-        setConflictValue(null);
-      } catch (_) {
-        setStatus('error');
-        setError('다른 탭에서 손상된 데이터가 감지되어 반영하지 않았습니다.');
+        setState((prev) => ({
+          ...prev,
+          value: parsed,
+          status: 'saved',
+          error: null,
+          conflictValue: null,
+        }));
+      } catch {
+        setState((prev) => ({
+          ...prev,
+          status: 'error',
+          error: '다른 탭에서 손상된 데이터가 감지되어 반영하지 않았습니다.',
+        }));
       }
     };
 
     window.addEventListener('storage', handleStorageChange);
     return () => window.removeEventListener('storage', handleStorageChange);
-  }, [key, metaKey, validate, storedValue, status]);
+  }, [key, metaKey, validate, state.value, state.status]);
 
   return [
-    storedValue,
+    state.value,
     setValue,
     {
-      status, // 'saved' | 'error' | 'corrupted' | 'conflict'
-      error,
+      status: state.status, // 'saved' | 'error' | 'corrupted' | 'conflict'
+      error: state.error,
       retrySave,
-      conflictValue,
+      conflictValue: state.conflictValue,
       acceptRemoteValue,
-      backupKey: initialLoadRef.current.backupKey,
+      backupKey: state.backupKey,
     },
   ];
 }
