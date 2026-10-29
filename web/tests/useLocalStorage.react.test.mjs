@@ -65,10 +65,12 @@ function setupDomEnvironment() {
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
   // 외부 탭에서 storage 이벤트가 발생했을 때 시뮬레이션 (실제 브라우저처럼 백엔드 store를 변경 후 현재 탭의 리스너 호출)
-  function dispatchExternalTabChange(key, newRawValue, remoteUpdatedAt = Date.now()) {
+  function dispatchExternalTabChange(key, newRawValue, { updateStore = true, remoteUpdatedAt = Date.now() } = {}) {
     const oldValue = store.has(key) ? store.get(key) : null;
-    store.set(key, newRawValue);
-    store.set(`${key}__meta`, JSON.stringify({ updatedAt: remoteUpdatedAt, tabId: 'external_tab' }));
+    if (updateStore) {
+      store.set(key, newRawValue);
+      store.set(`${key}__meta`, JSON.stringify({ updatedAt: remoteUpdatedAt, tabId: 'external_tab' }));
+    }
 
     for (const listener of [...storageListeners]) {
       listener({
@@ -154,7 +156,9 @@ const DATASETS = [
     localEdit1: '현재 탭에서 편집 중인 메모 초안 1',
     remoteConflict: '외부 탭에서 충돌로 들어온 메모 2',
     localEditDuringConflict: '충돌 상태에서도 계속 입력한 로컬 메모 2',
+    localEditAfterRemoteError: '외부 오류 발생 후에도 추가 입력한 로컬 메모 3',
     corruptedRaw: '{"not":"a_string"}',
+    malformedJsonRaw: '{broken_json_syntax',
   },
   {
     label: '할 일 (TodoList)',
@@ -174,7 +178,11 @@ const DATASETS = [
       { id: 4, text: '충돌 중 추가한 로컬 할 일 2', completed: false },
       { id: 3, text: '로컬 편집 할 일 1', completed: false },
     ],
+    localEditAfterRemoteError: [
+      { id: 5, text: '외부 오류 후 추가한 로컬 할 일 3', completed: false },
+    ],
     corruptedRaw: '[{"id":1,"text":12345,"completed":"not_boolean"}]',
+    malformedJsonRaw: '[{"id":1, broken_json',
   },
   {
     label: '상용구 (Snippets)',
@@ -194,14 +202,18 @@ const DATASETS = [
       { id: 4, title: '충돌 중 추가 상용구 2', text: '감사합니다' },
       { id: 3, title: '로컬 상용구 1', text: '검토 부탁드립니다' },
     ],
+    localEditAfterRemoteError: [
+      { id: 5, title: '외부 오류 후 추가 상용구 3', text: '확인 완료' },
+    ],
     corruptedRaw: '{"broken":"snippets_array"}',
+    malformedJsonRaw: '{"broken_json',
   },
 ];
 
 for (const ds of DATASETS) {
-  console.log(`\n--- [${ds.label}] 5대 핵심 시나리오 검증 ---`);
+  console.log(`\n--- [${ds.label}] 7대 핵심 시나리오 검증 ---`);
 
-  // 시나리오 A: 일반 외부 변경 반영 시 쓰기 0회
+  // 시나리오 1: 일반 외부 변경 반영 시 쓰기 0회
   {
     const env = setupDomEnvironment();
     const { captured, unmount } = mountHookInReact(env, {
@@ -225,7 +237,7 @@ for (const ds of DATASETS) {
     console.log(`  ✓ 1) 일반 외부 변경 반영 시 쓰기 0회 확인`);
   }
 
-  // 시나리오 B & C: 편집 중 충돌 시 선택 전 쓰기 0회 + 충돌 상태 유지 + 로컬 유지/외부 값 적용의 명시적 선택
+  // 시나리오 2 & 3: 편집 중 충돌 -> 외부 JSON/스키마 오류 주입 -> 추가 입력 시 쓰기 0회 & 기존 유효 충돌 후보 보존 -> 명시적 충돌 해결
   {
     const env = setupDomEnvironment();
     const { captured, unmount } = mountHookInReact(env, {
@@ -242,61 +254,78 @@ for (const ds of DATASETS) {
     });
     assert.equal(env.getWriteCount(ds.key), 1, `[${ds.label}] 로컬 편집 시 1회 저장됨`);
 
-    // 카운터 초기화 후 외부 탭 변경 발생 -> 충돌 진입
+    // 카운터 초기화 후 유효한 외부 탭 변경 발생 -> conflict 진입
     env.resetWriteCounts();
     act(() => {
       env.dispatchExternalTabChange(ds.key, JSON.stringify(ds.remoteConflict));
     });
 
     assert.equal(captured.meta.status, 'conflict', `[${ds.label}] 편집 중 외부 변경 수신 시 conflict 상태여야 함`);
-    assert.deepEqual(captured.value, ds.localEdit1, `[${ds.label}] 로컬 편집 내용이 덮어써지지 않아야 함`);
-    assert.deepEqual(captured.meta.conflictValue, ds.remoteConflict, `[${ds.label}] 외부 충돌 후보가 보존되어야 함`);
+    assert.equal(captured.meta.hasUnresolvedConflict, true, `[${ds.label}] hasUnresolvedConflict가 true여야 함`);
+    assert.deepEqual(captured.meta.conflictValue, ds.remoteConflict, `[${ds.label}] 유효한 외부 충돌 후보가 보존되어야 함`);
     assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] 충돌 감지 시 쓰기 0회여야 함`);
 
-    // ★ 핵심 검증: conflict 상태에서 사용자가 해결을 선택하기 전에 추가로 로컬 편집을 계속하더라도
-    // 자동 저장이 차단(쓰기 0회)되고, conflict 상태와 conflictValue 후보가 삭제되지 않고 그대로 유지되어야 함!
+    // [추가 조합 검증 A] conflict 상태에서 외부 스키마 오류 및 외부 JSON 파싱 오류가 연달아 발생하더라도
+    // 기존 유효 충돌 후보(conflictValue)가 보존되고, 이후 사용자의 추가 입력(setValue)도 쓰기 0회로 차단되어야 함!
     act(() => {
-      captured.setValue(ds.localEditDuringConflict);
+      env.dispatchExternalTabChange(ds.key, ds.corruptedRaw, { updateStore: false });
     });
-    assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] conflict 상태에서 명시적 해결 전 추가 로컬 편집 시 자동 저장 쓰기는 0회여야 함`);
-    assert.equal(captured.meta.status, 'conflict', `[${ds.label}] 명시적 해결 전에는 추가 편집 후에도 conflict 상태가 유지되어야 함`);
-    assert.deepEqual(captured.meta.conflictValue, ds.remoteConflict, `[${ds.label}] 명시적 해결 전에는 충돌 후보(conflictValue)가 삭제되지 않아야 함`);
-    assert.deepEqual(captured.value, ds.localEditDuringConflict, `[${ds.label}] 화면 입력값은 최신 로컬 편집값으로 유지되어야 함`);
+    assert.equal(captured.meta.hasUnresolvedConflict, true, `[${ds.label}] 외부 스키마 오류 후에도 충돌 보호 플래그가 유지되어야 함`);
+    assert.deepEqual(captured.meta.conflictValue, ds.remoteConflict, `[${ds.label}] 외부 스키마 오류 시 기존 유효 충돌 후보가 손실되지 않아야 함`);
 
-    // 명시적 선택 1: 외부 값 적용 (acceptRemoteValue) -> 쓰기 0회로 상태 해결
     act(() => {
-      captured.meta.acceptRemoteValue();
+      env.dispatchExternalTabChange(ds.key, ds.malformedJsonRaw, { updateStore: false });
     });
-    assert.equal(captured.meta.status, 'saved', `[${ds.label}] 외부 값 적용 선택 후 saved 상태로 전환되어야 함`);
-    assert.equal(captured.meta.conflictValue, null, `[${ds.label}] 해결 후 conflictValue가 비워져야 함`);
-    assert.deepEqual(captured.value, ds.remoteConflict, `[${ds.label}] 외부 값으로 상태가 전환되어야 함`);
-    assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] 외부 값 수용 시 불필요한 재저장 쓰기는 0회여야 함`);
+    assert.equal(captured.meta.hasUnresolvedConflict, true, `[${ds.label}] 외부 JSON 오류 후에도 충돌 보호 플래그가 유지되어야 함`);
+    assert.deepEqual(captured.meta.conflictValue, ds.remoteConflict, `[${ds.label}] 외부 JSON 오류 시에도 기존 유효 충돌 후보가 보존되어야 함`);
 
-    // 다시 충돌 발생시킨 뒤 명시적 선택 2: 내 로컬 값으로 저장 (retrySave) 검증
+    // 외부 JSON/스키마 오류 이후 사용자가 추가로 로컬 입력을 수행 -> 쓰기 0회여야 함!
+    act(() => {
+      captured.setValue(ds.localEditAfterRemoteError);
+    });
+    assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] conflict -> 외부 JSON/스키마 오류 -> 추가 입력 시 쓰기는 반드시 0회여야 함`);
+    assert.equal(captured.meta.status, 'conflict', `[${ds.label}] 추가 입력 후에도 conflict 상태가 유지되어야 함`);
+    assert.deepEqual(captured.meta.conflictValue, ds.remoteConflict, `[${ds.label}] 추가 입력 후에도 기존 유효 충돌 후보가 그대로 보존되어야 함`);
+    assert.deepEqual(captured.value, ds.localEditAfterRemoteError, `[${ds.label}] 화면 값은 최신 로컬 입력값이어야 함`);
+
+    // 보호 유지 후 명시적 해결 1: 보존된 기존 유효 외부 값 적용 (acceptRemoteValue) -> 쓰기 0회로 해결
+    act(() => {
+      const accepted = captured.meta.acceptRemoteValue();
+      assert.equal(accepted, true, `[${ds.label}] 보존된 외부 충돌 후보를 명시적으로 적용할 수 있어야 함`);
+    });
+    assert.equal(captured.meta.status, 'saved');
+    assert.equal(captured.meta.hasUnresolvedConflict, false);
+    assert.equal(captured.meta.conflictValue, null);
+    assert.deepEqual(captured.value, ds.remoteConflict, `[${ds.label}] 보존되었던 유효 외부 충돌 후보로 정확히 전환되어야 함`);
+    assert.equal(env.getWriteCount(ds.key), 0);
+
+    // 다시 충돌 -> 외부 JSON 오류 발생 후 명시적 해결 2: 로컬 값 유지 저장 (retrySave) 검증
     act(() => {
       captured.setValue(ds.localEdit1);
     });
     env.resetWriteCounts();
     act(() => {
       env.dispatchExternalTabChange(ds.key, JSON.stringify(ds.remoteConflict));
+      env.dispatchExternalTabChange(ds.key, ds.malformedJsonRaw, { updateStore: false });
+      captured.setValue(ds.localEditDuringConflict);
     });
-    assert.equal(captured.meta.status, 'conflict');
-    assert.equal(env.getWriteCount(ds.key), 0);
+    assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] 명시적 해결 전까지는 쓰기 0회`);
 
     act(() => {
-      captured.meta.retrySave();
+      const saved = captured.meta.retrySave();
+      assert.equal(saved, true);
     });
-    assert.equal(captured.meta.status, 'saved', `[${ds.label}] 로컬 유지(retrySave) 선택 후 saved 상태로 전환되어야 함`);
-    assert.equal(captured.meta.conflictValue, null);
-    assert.equal(env.getWriteCount(ds.key), 1, `[${ds.label}] 로컬 유지 선택 시에만 정확히 1회 저장이 수행되어야 함`);
-    assert.deepEqual(JSON.parse(env.store.get(ds.key)), ds.localEdit1, `[${ds.label}] 스토리지에 로컬 선택값이 반영되어야 함`);
+    assert.equal(captured.meta.status, 'saved');
+    assert.equal(captured.meta.hasUnresolvedConflict, false);
+    assert.equal(env.getWriteCount(ds.key), 1, `[${ds.label}] 명시적 로컬 유지 선택(retrySave) 시 정확히 1회 저장됨`);
+    assert.deepEqual(JSON.parse(env.store.get(ds.key)), ds.localEditDuringConflict);
 
     unmount();
-    console.log(`  ✓ 2) 편집 중 충돌 시 선택 전 쓰기 0회 및 충돌 상태/후보 유지 확인`);
-    console.log(`  ✓ 3) 로컬 유지(retrySave) / 외부 값 적용(acceptRemoteValue) 명시적 선택 해결 확인`);
+    console.log(`  ✓ 2) conflict → 외부 JSON/스키마 오류 → 추가 입력: 쓰기 0회 및 기존 유효 충돌 후보 보존 확인`);
+    console.log(`  ✓ 3) 보호 유지 후 명시적 충돌 해결(acceptRemoteValue / retrySave) 확인`);
   }
 
-  // 시나리오 D: StrictMode에서 손상값 초기화 시 원본 키 덮어쓰기 0회 및 원본 보존 확인
+  // 시나리오 4: StrictMode에서 손상값 초기화 시 원본 키 덮어쓰기 0회 및 원본 보존 확인
   {
     const env = setupDomEnvironment();
     env.store.set(ds.key, ds.corruptedRaw);
@@ -306,21 +335,22 @@ for (const ds of DATASETS) {
       key: ds.key,
       initialValue: ds.initial,
       validate: ds.validate,
-      useStrictMode: true, // React.StrictMode 활성화 (이중 렌더링 및 이중 effect 실행)
+      useStrictMode: true,
     });
 
-    assert.equal(captured.meta.status, 'corrupted', `[${ds.label}] StrictMode 마운트 후 손상 상태(corrupted)여야 함`);
-    assert.equal(captured.meta.backupSaved, true, `[${ds.label}] 백업 성공 시 backupSaved가 true여야 함`);
-    assert.ok(captured.meta.backupKey, `[${ds.label}] 백업 키가 생성되어야 함`);
-    assert.equal(env.store.get(captured.meta.backupKey), ds.corruptedRaw, `[${ds.label}] 백업 키에 손상 원본이 보존되어야 함`);
-    assert.equal(env.store.get(ds.key), ds.corruptedRaw, `[${ds.label}] StrictMode effect 재실행에도 원본 키는 절대 덮어써지지 않아야 함`);
-    assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] 사용자 조작 전 원본 키 쓰기 횟수는 0회여야 함`);
+    assert.equal(captured.meta.status, 'corrupted');
+    assert.equal(captured.meta.backupSaved, true);
+    assert.equal(captured.meta.needsRawBackup, false);
+    assert.ok(captured.meta.backupKey);
+    assert.equal(env.store.get(captured.meta.backupKey), ds.corruptedRaw);
+    assert.equal(env.store.get(ds.key), ds.corruptedRaw);
+    assert.equal(env.getWriteCount(ds.key), 0);
 
     unmount();
     console.log(`  ✓ 4) StrictMode 손상값 초기화 시 원본 키 덮어쓰기 0회 및 백업 보존 확인`);
   }
 
-  // 시나리오 E: 백업 실패 시 "원본 보존 완료" 미표시(backupSaved=false) + 원본 확보 전 복구 저장/편집 덮어쓰기 차단 + 저장 용량 초과 복구
+  // 시나리오 5 & 6: 백업 실패 → 외부 JSON/스키마 오류 → 재시도(retrySave) 및 추가 입력(setValue): 쓰기 0회 차단 → 공간 확보 후 백업 복구
   {
     const env = setupDomEnvironment();
     env.store.set(ds.key, ds.corruptedRaw);
@@ -335,56 +365,66 @@ for (const ds of DATASETS) {
       useStrictMode: true,
     });
 
-    assert.equal(captured.meta.status, 'corrupted', `[${ds.label}] 손상 감지 상태여야 함`);
-    assert.equal(captured.meta.backupSaved, false, `[${ds.label}] 백업 실패 시 backupSaved는 반드시 false여야 함`);
-    assert.equal(captured.meta.backupKey, null, `[${ds.label}] 백업 실패 시 backupKey는 null이어야 함`);
-    assert.ok(
-      !captured.meta.error.includes('원본을 \'null\'에 보존'),
-      `[${ds.label}] 백업 실패 시 거짓 보존 완료 메시지를 표시하지 않아야 함`
-    );
+    assert.equal(captured.meta.status, 'corrupted');
+    assert.equal(captured.meta.backupSaved, false);
+    assert.equal(captured.meta.needsRawBackup, true, `[${ds.label}] 백업 실패 시 needsRawBackup 보호 플래그가 true여야 함`);
+    assert.equal(captured.meta.backupKey, null);
 
-    // 백업이 여전히 실패하는 상태에서 retrySave 또는 사용자 편집(setValue) 시도 -> 원본 키를 절대 덮어쓰지 않아야 함!
+    // [추가 조합 검증 B] 백업 실패 상태에서 외부 스키마 오류 및 외부 JSON 파싱 오류가 발생하더라도
+    // 미백업 원본 보호(needsRawBackup)가 풀리지 않고 retrySave와 setValue 모두 쓰기 0회로 차단되어야 함!
     act(() => {
-      captured.meta.retrySave();
+      env.dispatchExternalTabChange(ds.key, ds.corruptedRaw, { updateStore: false });
+      env.dispatchExternalTabChange(ds.key, ds.malformedJsonRaw, { updateStore: false });
     });
-    assert.equal(env.store.get(ds.key), ds.corruptedRaw, `[${ds.label}] 백업 실패 상태에서 retrySave 호출 시 원본 키를 덮어쓰지 않아야 함`);
-    assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] 백업 확보 전 원본 키 쓰기는 0회여야 함`);
+    assert.equal(captured.meta.needsRawBackup, true, `[${ds.label}] 외부 JSON/스키마 오류 후에도 needsRawBackup 플래그가 유지되어야 함`);
+
+    act(() => {
+      const retryResult = captured.meta.retrySave();
+      assert.equal(retryResult, false, `[${ds.label}] 백업 실패 -> 외부 오류 -> 재시도 시 백업이 여전히 불가능하면 false를 반환하고 차단해야 함`);
+    });
+    assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] 백업 실패 -> 외부 JSON/스키마 오류 -> 재시도 시 원본 키 쓰기는 반드시 0회여야 함`);
+    assert.equal(env.store.get(ds.key), ds.corruptedRaw, `[${ds.label}] 미백업 원본 키가 그대로 보존되어야 함`);
 
     act(() => {
       captured.setValue(ds.localEdit1);
     });
-    assert.equal(env.store.get(ds.key), ds.corruptedRaw, `[${ds.label}] 백업 실패 상태에서 로컬 편집 시에도 원본 키를 덮어쓰지 않아야 함`);
-    assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] 백업 확보 전 원본 키 쓰기는 0회여야 함`);
-    assert.deepEqual(captured.value, ds.localEdit1, `[${ds.label}] 화면상의 입력값은 유지되어야 함`);
+    assert.equal(env.getWriteCount(ds.key), 0, `[${ds.label}] 백업 실패 -> 외부 오류 -> 로컬 추가 입력(setValue) 시에도 원본 키 쓰기는 0회여야 함`);
+    assert.equal(env.store.get(ds.key), ds.corruptedRaw, `[${ds.label}] 미백업 원본 키가 덮어써지지 않아야 함`);
+    assert.deepEqual(captured.value, ds.localEdit1, `[${ds.label}] 화면 입력값은 유지되어야 함`);
 
-    // 이제 백업 공간이 확보된 경우 retrySave 시 원본 백업 후 복구 저장 성공 확인
+    // 이제 백업 공간 확보 후 명시적 백업 및 복구 재시도(retrySave) 수행 -> 원본 백업 완수 후 복구 저장 성공 확인
     env.setFailBackupWrites(false);
     act(() => {
       const ok = captured.meta.retrySave();
-      assert.equal(ok, true, `[${ds.label}] 공간 확보 후 retrySave 시 원본 백업 완수 후 복구 저장이 성공해야 함`);
+      assert.equal(ok, true, `[${ds.label}] 백업 공간 확보 후 retrySave 시 원본 백업 완수 후 복구 저장이 성공해야 함`);
     });
-    assert.equal(captured.meta.backupSaved, true, `[${ds.label}] 백업 성공 상태가 기록되어야 함`);
-    assert.equal(env.store.get(captured.meta.backupKey), ds.corruptedRaw, `[${ds.label}] 원본이 백업 키에 안전히 보존되어야 함`);
+    assert.equal(captured.meta.backupSaved, true, `[${ds.label}] 백업 성공 상태가 true여야 함`);
+    assert.equal(captured.meta.needsRawBackup, false, `[${ds.label}] 백업 완료 후 needsRawBackup이 해제되어야 함`);
+    assert.ok(captured.meta.backupKey, `[${ds.label}] 백업 키가 생성되어야 함`);
+    assert.equal(env.store.get(captured.meta.backupKey), ds.corruptedRaw, `[${ds.label}] 손상 원본이 백업 키에 안전히 보존되어야 함`);
     assert.equal(captured.meta.status, 'saved', `[${ds.label}] 복구 저장 완료 후 saved 상태가 되어야 함`);
+    assert.equal(env.getWriteCount(ds.key), 1, `[${ds.label}] 백업 확보 후 정확히 1회 복구 저장이 수행되어야 함`);
+    assert.deepEqual(JSON.parse(env.store.get(ds.key)), ds.localEdit1);
 
     // 일반 저장 용량 초과(QuotaExceededError) 시 입력 유지 및 재시도 검증
     env.setFailAllWrites(true);
     act(() => {
       captured.setValue(ds.localEditDuringConflict);
     });
-    assert.equal(captured.meta.status, 'error', `[${ds.label}] 용량 초과 시 error 상태여야 함`);
-    assert.deepEqual(captured.value, ds.localEditDuringConflict, `[${ds.label}] 저장 실패 시에도 화면 입력값은 유지되어야 함`);
+    assert.equal(captured.meta.status, 'error');
+    assert.deepEqual(captured.value, ds.localEditDuringConflict);
 
     env.setFailAllWrites(false);
     act(() => {
       captured.meta.retrySave();
     });
-    assert.equal(captured.meta.status, 'saved', `[${ds.label}] 용량 확보 후 재시도 시 saved로 복구되어야 함`);
+    assert.equal(captured.meta.status, 'saved');
     assert.deepEqual(JSON.parse(env.store.get(ds.key)), ds.localEditDuringConflict);
 
     unmount();
-    console.log(`  ✓ 5) 백업 실패 시 원본 덮어쓰기 차단 및 용량 초과 복구 확인`);
+    console.log(`  ✓ 5) 백업 실패 → 외부 JSON/스키마 오류 → 재시도/추가입력: 쓰기 0회 차단 확인`);
+    console.log(`  ✓ 6) 보호 유지 후 공간 확보 시 원본 백업 완수 및 복구 저장 확인`);
   }
 }
 
-console.log('\n=== 모든 React StrictMode / 다중 탭 / 충돌 차단 / 백업 보호 테스트 100% 통과 ===');
+console.log('\n=== 모든 React StrictMode / 보호 상태 유지 / 외부 오류 내성 / 백업 복구 테스트 100% 통과 ===');

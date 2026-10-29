@@ -1,265 +1,239 @@
 import assert from 'node:assert/strict';
+import React, { StrictMode, act } from 'react';
+import { createRoot } from 'react-dom/client';
+import { JSDOM } from 'jsdom';
+import { useLocalStorage, validators } from '../src/hooks/useLocalStorage.js';
 
-console.log('=== [기존 verify_audit.mjs 검증] useLocalStorage 다중 탭 동기화 / 충돌 방지 / 스키마 검증 / 원본 보존 테스트 ===');
+console.log('=== [verify_audit.mjs — 실제 제품 훅(src/hooks/useLocalStorage.js) 기반 다중 탭 클러스터 검증] ===');
 
-function createSharedStorageCluster() {
-  const store = new Map();
-  const tabs = [];
+/**
+ * 두 개의 독립된 브라우저 탭(TabA, TabB)이 각각 실제 React 트리와 실제 `useLocalStorage` 훅을 마운트하고,
+ * 동일한 백엔드 스토리지 클러스터를 공유하며 `storage` 이벤트를 주고받는 통합 검증 환경
+ */
+function createTwoTabReactCluster() {
+  const sharedStore = new Map();
+  const keyWriteCounts = new Map();
+  const tabContexts = [];
 
-  function createTab(name) {
-    const listeners = [];
+  function createReactTab(tabName) {
+    const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
+      url: 'https://web-seven-wine-12.vercel.app/',
+    });
+
     let quotaExceeded = false;
+    let failBackupWrites = false;
+    const storageListeners = new Set();
 
-    const localStorageMock = {
+    const localStorageProxy = {
       getItem(k) {
-        return store.has(k) ? store.get(k) : null;
+        return sharedStore.has(k) ? sharedStore.get(k) : null;
       },
       setItem(k, v) {
         if (quotaExceeded) {
-          throw new Error('QuotaExceededError: 로컬 스토리지 용량 초과 시뮬레이션');
+          throw new Error('QuotaExceededError: 로컬 스토리지 용량 초과');
         }
-        const oldValue = store.has(k) ? store.get(k) : null;
+        if (failBackupWrites && k.includes('__corrupted_backup_')) {
+          throw new Error('QuotaExceededError: 백업 공간 부족');
+        }
+        const oldValue = sharedStore.has(k) ? sharedStore.get(k) : null;
         const newValue = String(v);
-        store.set(k, newValue);
+        sharedStore.set(k, newValue);
+        keyWriteCounts.set(`${tabName}:${k}`, (keyWriteCounts.get(`${tabName}:${k}`) || 0) + 1);
 
-        for (const otherTab of tabs) {
-          if (otherTab !== tabObj) {
-            otherTab.dispatchStorageEvent({
-              key: k,
-              oldValue,
-              newValue,
-              storageArea: otherTab.localStorage,
-            });
+        // 다른 탭들에 실제 storage 이벤트 전파
+        for (const other of tabContexts) {
+          if (other !== ctx) {
+            other.receiveStorageEvent(k, oldValue, newValue);
           }
         }
       },
       removeItem(k) {
-        store.delete(k);
+        sharedStore.delete(k);
       },
     };
 
-    const tabObj = {
-      name,
-      localStorage: localStorageMock,
+    Object.defineProperty(dom.window, 'localStorage', {
+      value: localStorageProxy,
+      configurable: true,
+    });
+
+    const origAdd = dom.window.addEventListener.bind(dom.window);
+    const origRemove = dom.window.removeEventListener.bind(dom.window);
+    dom.window.addEventListener = (type, fn, opts) => {
+      if (type === 'storage') storageListeners.add(fn);
+      return origAdd(type, fn, opts);
+    };
+    dom.window.removeEventListener = (type, fn, opts) => {
+      if (type === 'storage') storageListeners.delete(fn);
+      return origRemove(type, fn, opts);
+    };
+
+    const ctx = {
+      tabName,
+      dom,
       setQuotaExceeded(flag) {
         quotaExceeded = flag;
       },
-      addEventListener(type, fn) {
-        if (type === 'storage') listeners.push(fn);
+      setFailBackupWrites(flag) {
+        failBackupWrites = flag;
       },
-      removeEventListener(type, fn) {
-        const idx = listeners.indexOf(fn);
-        if (idx >= 0) listeners.splice(idx, 1);
+      getWriteCount(k) {
+        return keyWriteCounts.get(`${tabName}:${k}`) || 0;
       },
-      dispatchStorageEvent(ev) {
-        for (const fn of [...listeners]) {
-          fn(ev);
+      receiveStorageEvent(key, oldValue, newValue) {
+        // 해당 탭의 window 컨텍스트를 활성화하여 storage 리스너 실행
+        globalThis.window = dom.window;
+        globalThis.document = dom.window.document;
+        for (const fn of [...storageListeners]) {
+          fn({
+            key,
+            oldValue,
+            newValue,
+            storageArea: localStorageProxy,
+          });
         }
+      },
+      mountActualHook(key, initialValue, { validate, initialEditing = false } = {}) {
+        globalThis.window = dom.window;
+        globalThis.document = dom.window.document;
+        globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+        const container = dom.window.document.createElement('div');
+        dom.window.document.body.appendChild(container);
+        const root = createRoot(container);
+
+        const captured = {
+          value: undefined,
+          setValue: null,
+          meta: null,
+          setEditing: null,
+        };
+
+        function onCapture(snapshot) {
+          Object.assign(captured, snapshot);
+        }
+
+        function HookHost({ report }) {
+          const [editing, setEditing] = React.useState(initialEditing);
+          const [val, setVal, meta] = useLocalStorage(key, initialValue, {
+            validate,
+            isEditing: editing,
+          });
+          React.useLayoutEffect(() => {
+            report({ value: val, setValue: setVal, meta, setEditing });
+          }, [report, val, setVal, meta, setEditing]);
+          return null;
+        }
+
+        act(() => {
+          root.render(React.createElement(StrictMode, null, React.createElement(HookHost, { report: onCapture })));
+        });
+
+        return {
+          get state() {
+            return {
+              storedValue: captured.value,
+              status: captured.meta.status,
+              error: captured.meta.error,
+              backupKey: captured.meta.backupKey,
+              backupSaved: captured.meta.backupSaved,
+              conflictValue: captured.meta.conflictValue,
+              hasUnresolvedConflict: captured.meta.hasUnresolvedConflict,
+              needsRawBackup: captured.meta.needsRawBackup,
+              writeCount: ctx.getWriteCount(key),
+            };
+          },
+          setValue(v) {
+            globalThis.window = dom.window;
+            globalThis.document = dom.window.document;
+            act(() => {
+              captured.setValue(v);
+            });
+          },
+          setEditing(flag) {
+            globalThis.window = dom.window;
+            globalThis.document = dom.window.document;
+            act(() => {
+              captured.setEditing(flag);
+            });
+          },
+          retrySave() {
+            globalThis.window = dom.window;
+            globalThis.document = dom.window.document;
+            let res = false;
+            act(() => {
+              res = captured.meta.retrySave();
+            });
+            return res;
+          },
+          acceptRemoteValue() {
+            globalThis.window = dom.window;
+            globalThis.document = dom.window.document;
+            let res = false;
+            act(() => {
+              res = captured.meta.acceptRemoteValue();
+            });
+            return res;
+          },
+          unmount() {
+            globalThis.window = dom.window;
+            globalThis.document = dom.window.document;
+            act(() => {
+              root.unmount();
+            });
+            container.remove();
+          },
+        };
       },
     };
 
-    tabs.push(tabObj);
-    return tabObj;
+    tabContexts.push(ctx);
+    return ctx;
   }
 
-  return { store, createTab };
+  return { sharedStore, createReactTab };
 }
 
-const validators = {
-  memo: (val) => typeof val === 'string',
-  theme: (val) => val === 'system' || val === 'light' || val === 'dark',
-  todos: (val) =>
-    Array.isArray(val) &&
-    val.every(
-      (item) =>
-        item &&
-        typeof item === 'object' &&
-        (typeof item.id === 'number' || typeof item.id === 'string') &&
-        typeof item.text === 'string' &&
-        typeof item.completed === 'boolean'
-    ),
-  snippets: (val) =>
-    Array.isArray(val) &&
-    val.every(
-      (item) =>
-        item &&
-        typeof item === 'object' &&
-        (typeof item.id === 'number' || typeof item.id === 'string') &&
-        typeof item.title === 'string' &&
-        typeof item.text === 'string'
-    ),
-};
-
-function mountStorageInstance(tab, key, initialValue, { validate, isEditing = false } = {}) {
-  const metaKey = `${key}__meta`;
-  let storedValue = initialValue;
-  let status = 'saved';
-  let error = null;
-  let backupKey = null;
-  let backupSaved = false;
-  let corruptedRaw = null;
-  let conflictValue = null;
-  let writeCount = 0;
-  let lastLocalEditTime = 0;
-  let editing = isEditing;
-
-  const raw = tab.localStorage.getItem(key);
-  if (raw !== null) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (!validate || validate(parsed)) {
-        storedValue = parsed;
-      } else {
-        corruptedRaw = raw;
-        const candidate = `${key}__corrupted_backup_${Date.now()}`;
-        try {
-          tab.localStorage.setItem(candidate, raw);
-          backupKey = candidate;
-          backupSaved = true;
-        } catch {
-          backupKey = null;
-          backupSaved = false;
-        }
-        status = 'corrupted';
-        error = backupSaved ? `스키마 손상 보존됨: ${backupKey}` : '백업 실패';
-      }
-    } catch {
-      corruptedRaw = raw;
-      const candidate = `${key}__corrupted_backup_${Date.now()}`;
-      try {
-        tab.localStorage.setItem(candidate, raw);
-        backupKey = candidate;
-        backupSaved = true;
-      } catch {
-        backupKey = null;
-        backupSaved = false;
-      }
-      status = 'corrupted';
-      error = backupSaved ? `JSON 손상 보존됨: ${backupKey}` : '백업 실패';
-    }
-  }
-
-  function performSave(val) {
-    try {
-      if (validate && !validate(val)) {
-        status = 'error';
-        error = '스키마 검증 실패';
-        return false;
-      }
-      const now = Date.now();
-      tab.localStorage.setItem(key, JSON.stringify(val));
-      tab.localStorage.setItem(metaKey, JSON.stringify({ updatedAt: now, tabId: tab.name }));
-      writeCount++;
-      status = 'saved';
-      error = null;
-      conflictValue = null;
-      corruptedRaw = null;
-      return true;
-    } catch (err) {
-      status = 'error';
-      error = err.message;
-      return false;
-    }
-  }
-
-  function setValue(nextVal) {
-    lastLocalEditTime = Date.now();
-    storedValue = typeof nextVal === 'function' ? nextVal(storedValue) : nextVal;
-    if (status === 'conflict') {
-      return;
-    }
-    if (status === 'corrupted' && !backupSaved && corruptedRaw !== null) {
-      return;
-    }
-    performSave(storedValue);
-  }
-
-  tab.addEventListener('storage', (e) => {
-    if (e.key !== key || e.newValue === null) return;
-    try {
-      const parsed = JSON.parse(e.newValue);
-      if (validate && !validate(parsed)) {
-        status = 'error';
-        error = '외부 탭 손상 데이터 감지';
-        return;
-      }
-      if (status !== 'conflict' && JSON.stringify(parsed) === JSON.stringify(storedValue)) return;
-
-      const isRecentlyEdited = Date.now() - lastLocalEditTime < 3000;
-      if (status === 'conflict' || status === 'error' || editing || isRecentlyEdited) {
-        conflictValue = parsed;
-        status = 'conflict';
-        error = '편집 중 충돌 감지 (자동 덮어쓰기 차단)';
-        return;
-      }
-
-      storedValue = parsed;
-      status = 'saved';
-      error = null;
-      conflictValue = null;
-    } catch {
-      status = 'error';
-    }
-  });
-
-  return {
-    get state() {
-      return { storedValue, status, error, backupKey, backupSaved, conflictValue, writeCount };
-    },
-    setValue,
-    setEditing(flag) {
-      editing = flag;
-      if (flag) lastLocalEditTime = Date.now();
-    },
-    retrySave() {
-      return performSave(storedValue);
-    },
-    acceptRemoteValue() {
-      if (conflictValue !== null) {
-        storedValue = conflictValue;
-        conflictValue = null;
-        status = 'saved';
-        error = null;
-      }
-    },
-  };
-}
-
-// 1~5 검증 실행
+// 1. 메모(Memo) 실제 훅 두 탭 동기화 + 재저장 루프 차단 + 편집 중 충돌 보호 검증
 {
-  const cluster = createSharedStorageCluster();
-  const tabA = cluster.createTab('TabA');
-  const tabB = cluster.createTab('TabB');
+  const cluster = createTwoTabReactCluster();
+  const tabA = cluster.createReactTab('TabA');
+  const tabB = cluster.createReactTab('TabB');
 
-  const memoA = mountStorageInstance(tabA, 'tabpad_memo', '초기 메모', { validate: validators.memo });
-  const memoB = mountStorageInstance(tabB, 'tabpad_memo', '초기 메모', { validate: validators.memo });
+  const memoA = tabA.mountActualHook('tabpad_memo', '초기 메모', { validate: validators.memo });
+  const memoB = tabB.mountActualHook('tabpad_memo', '초기 메모', { validate: validators.memo });
 
-  const initialWritesB = memoB.state.writeCount;
+  assert.equal(memoB.state.writeCount, 0, '초기 마운트 시 쓰기 0회');
   memoA.setValue('탭 A에서 수정한 첫 번째 메모');
 
-  assert.equal(memoB.state.storedValue, '탭 A에서 수정한 첫 번째 메모');
-  assert.equal(memoB.state.writeCount, initialWritesB);
+  assert.equal(memoB.state.storedValue, '탭 A에서 수정한 첫 번째 메모', '탭 B에 탭 A의 변경이 즉시 반영되어야 함');
+  assert.equal(memoB.state.writeCount, 0, '탭 B는 외부 변경 수신 시 재저장(쓰기)을 수행하지 않아야 함');
 
+  // 탭 B 편집 중 충돌 재현
   memoB.setEditing(true);
   memoB.setValue('탭 B에서 현재 작성 중인 최신 메모 초안');
-  // 탭 A의 conflict(이전 단계에서 탭 B의 저장으로 인해 발생한 충돌)를 해결한 뒤 탭 A가 새 값을 저장하여 탭 B에 충돌 유발
+  // 탭 A가 이전 충돌을 수용한 뒤 새 값을 저장하여 탭 B에 충돌 유발
   memoA.acceptRemoteValue();
   memoA.setValue('오래된 탭 A에서 뒤늦게 보낸 메모');
 
   assert.equal(memoB.state.storedValue, '탭 B에서 현재 작성 중인 최신 메모 초안');
   assert.equal(memoB.state.status, 'conflict');
   assert.equal(memoB.state.conflictValue, '오래된 탭 A에서 뒤늦게 보낸 메모');
-  console.log('✓ [verify_audit 1 통과] 메모 두 탭 동기화 및 충돌 보호 완료');
+
+  memoA.unmount();
+  memoB.unmount();
+  console.log('✓ [verify_audit 1 통과] 실제 useLocalStorage 훅 기반 메모(Memo) 두 탭 동기화 및 충돌 보호 완료');
 }
 
+// 2. 할 일(Todos) 실제 훅 두 탭 동기화 + 충돌 보호 검증
 {
-  const cluster = createSharedStorageCluster();
-  const tabA = cluster.createTab('TabA');
-  const tabB = cluster.createTab('TabB');
+  const cluster = createTwoTabReactCluster();
+  const tabA = cluster.createReactTab('TabA');
+  const tabB = cluster.createReactTab('TabB');
 
   const initTodos = [{ id: 1, text: '기본 할 일', completed: false }];
-  const todosA = mountStorageInstance(tabA, 'tabpad_todos', initTodos, { validate: validators.todos });
-  const todosB = mountStorageInstance(tabB, 'tabpad_todos', initTodos, { validate: validators.todos });
+  const todosA = tabA.mountActualHook('tabpad_todos', initTodos, { validate: validators.todos });
+  const todosB = tabB.mountActualHook('tabpad_todos', initTodos, { validate: validators.todos });
 
   todosA.setValue([{ id: 2, text: '탭 A에서 추가한 할 일', completed: false }, ...initTodos]);
   assert.equal(todosB.state.storedValue.length, 2);
@@ -269,17 +243,21 @@ function mountStorageInstance(tab, key, initialValue, { validate, isEditing = fa
   todosA.setValue([{ id: 1, text: '기본 할 일', completed: true }]);
   assert.equal(todosB.state.status, 'conflict');
   assert.equal(todosB.state.storedValue.length, 2);
-  console.log('✓ [verify_audit 2 통과] 할 일 두 탭 동기화 및 충돌 보호 완료');
+
+  todosA.unmount();
+  todosB.unmount();
+  console.log('✓ [verify_audit 2 통과] 실제 useLocalStorage 훅 기반 할 일(TodoList) 두 탭 동기화 및 충돌 보호 완료');
 }
 
+// 3. 상용구(Snippets) 실제 훅 두 탭 동기화 + 충돌 보호 검증
 {
-  const cluster = createSharedStorageCluster();
-  const tabA = cluster.createTab('TabA');
-  const tabB = cluster.createTab('TabB');
+  const cluster = createTwoTabReactCluster();
+  const tabA = cluster.createReactTab('TabA');
+  const tabB = cluster.createReactTab('TabB');
 
   const initSnippets = [{ id: 1, title: '인사', text: '안녕하세요' }];
-  const snipA = mountStorageInstance(tabA, 'tabpad_snippets', initSnippets, { validate: validators.snippets });
-  const snipB = mountStorageInstance(tabB, 'tabpad_snippets', initSnippets, { validate: validators.snippets });
+  const snipA = tabA.mountActualHook('tabpad_snippets', initSnippets, { validate: validators.snippets });
+  const snipB = tabB.mountActualHook('tabpad_snippets', initSnippets, { validate: validators.snippets });
 
   snipA.setValue([{ id: 2, title: '회의', text: '줌 링크입니다' }, ...initSnippets]);
   assert.equal(snipB.state.storedValue.length, 2);
@@ -289,30 +267,38 @@ function mountStorageInstance(tab, key, initialValue, { validate, isEditing = fa
   snipA.setValue([]);
   assert.equal(snipB.state.status, 'conflict');
   assert.equal(snipB.state.storedValue.length, 2);
-  console.log('✓ [verify_audit 3 통과] 상용구 두 탭 동기화 및 충돌 보호 완료');
+
+  snipA.unmount();
+  snipB.unmount();
+  console.log('✓ [verify_audit 3 통과] 실제 useLocalStorage 훅 기반 상용구(Snippets) 두 탭 동기화 및 충돌 보호 완료');
 }
 
+// 4. 실제 훅 스키마 검증 및 손상값 원본 보존 검증
 {
-  const cluster = createSharedStorageCluster();
-  const tabA = cluster.createTab('TabA');
+  const cluster = createTwoTabReactCluster();
+  const tabA = cluster.createReactTab('TabA');
 
-  cluster.store.set('tabpad_memo', '{"invalid":"object_instead_of_string"}');
-  cluster.store.set('tabpad_theme', '"neon-purple"');
+  cluster.sharedStore.set('tabpad_memo', '{"invalid":"object_instead_of_string"}');
+  cluster.sharedStore.set('tabpad_theme', '"neon-purple"');
 
-  const memoInstance = mountStorageInstance(tabA, 'tabpad_memo', '복구된 기본 메모', { validate: validators.memo });
-  const themeInstance = mountStorageInstance(tabA, 'tabpad_theme', 'system', { validate: validators.theme });
+  const memoInstance = tabA.mountActualHook('tabpad_memo', '복구된 기본 메모', { validate: validators.memo });
+  const themeInstance = tabA.mountActualHook('tabpad_theme', 'system', { validate: validators.theme });
 
   assert.equal(memoInstance.state.status, 'corrupted');
-  assert.equal(cluster.store.get('tabpad_memo'), '{"invalid":"object_instead_of_string"}');
-  assert.ok(memoInstance.state.backupKey && cluster.store.get(memoInstance.state.backupKey) === '{"invalid":"object_instead_of_string"}');
+  assert.equal(cluster.sharedStore.get('tabpad_memo'), '{"invalid":"object_instead_of_string"}');
+  assert.ok(memoInstance.state.backupKey && cluster.sharedStore.get(memoInstance.state.backupKey) === '{"invalid":"object_instead_of_string"}');
   assert.equal(themeInstance.state.status, 'corrupted');
-  console.log('✓ [verify_audit 4 통과] 스키마 검증 및 손상값 원본 보존 완료');
+
+  memoInstance.unmount();
+  themeInstance.unmount();
+  console.log('✓ [verify_audit 4 통과] 실제 useLocalStorage 훅 기반 스키마 검증 및 손상값 원본 보존 완료');
 }
 
+// 5. 실제 훅 저장 오류 시 입력 유지 및 재시도 복구 검증
 {
-  const cluster = createSharedStorageCluster();
-  const tabA = cluster.createTab('TabA');
-  const memoA = mountStorageInstance(tabA, 'tabpad_memo', '초기값', { validate: validators.memo });
+  const cluster = createTwoTabReactCluster();
+  const tabA = cluster.createReactTab('TabA');
+  const memoA = tabA.mountActualHook('tabpad_memo', '초기값', { validate: validators.memo });
 
   tabA.setQuotaExceeded(true);
   memoA.setValue('용량 초과 상태에서 사용자가 열심히 작성한 메모');
@@ -324,5 +310,7 @@ function mountStorageInstance(tab, key, initialValue, { validate, isEditing = fa
   const retryOk = memoA.retrySave();
   assert.equal(retryOk, true);
   assert.equal(memoA.state.status, 'saved');
-  console.log('✓ [verify_audit 5 통과] 저장 오류 시 입력 유지 및 재시도 복구 완료');
+
+  memoA.unmount();
+  console.log('✓ [verify_audit 5 통과] 실제 useLocalStorage 훅 기반 저장 오류 시 입력 유지 및 재시도 복구 완료');
 }
