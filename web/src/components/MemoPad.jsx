@@ -12,7 +12,8 @@ const INITIAL_MEMO = `📌 TabPad 빠른 메모장에 오신 것을 환영합니
 /**
  * 메모장 및 실시간 글자수 세기 컴포넌트 (MemoPad)
  * - 입력 내용 변경 시 localStorage 자동 저장 (Auto-save)
- * - 저장 성공 시에만 "자동 저장됨" 표시, 실패/충돌/손상 시 입력 내용 유지 및 재시도 버튼 제공
+ * - 저장 성공 시에만 "자동 저장됨" 표시, 실패/충돌/손상 시 입력 내용 유지 및 재시도/해결 버튼 제공
+ * - 손상값 백업 성공 여부(backupSaved)에 따라 정직한 상태 배지 표시
  * - 하단에 공백 포함 / 공백 제외 글자수 실시간 표시
  */
 export default function MemoPad() {
@@ -20,7 +21,7 @@ export default function MemoPad() {
   const [
     memo,
     setMemo,
-    { status, error, retrySave, conflictValue, acceptRemoteValue },
+    { status, error, retrySave, conflictValue, acceptRemoteValue, backupSaved },
   ] = useLocalStorage('tabpad_memo', INITIAL_MEMO, {
     validate: validators.memo,
     isEditing: isFocused,
@@ -59,14 +60,19 @@ export default function MemoPad() {
               미저장 (저장 오류)
             </span>
           )}
-          {status === 'corrupted' && (
+          {status === 'corrupted' && backupSaved && (
             <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-100 text-amber-700 dark:bg-amber-950/70 dark:text-amber-400">
-              손상 데이터 복구됨 (원본 보존)
+              손상 데이터 복구됨 (원본 보존 완료)
+            </span>
+          )}
+          {status === 'corrupted' && !backupSaved && (
+            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-rose-100 text-rose-700 dark:bg-rose-950/70 dark:text-rose-400">
+              손상 감지됨 (원본 백업 실패 · 덮어쓰기 차단)
             </span>
           )}
           {status === 'conflict' && (
             <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-100 text-amber-700 dark:bg-amber-950/70 dark:text-amber-400">
-              다른 탭과 충돌 감지됨
+              다른 탭과 충돌 감지됨 (자동 저장 일시 중지)
             </span>
           )}
         </div>
@@ -80,7 +86,7 @@ export default function MemoPad() {
         </button>
       </div>
 
-      {/* 오류 / 충돌 / 손상 알림 및 재시도 배너 */}
+      {/* 오류 / 충돌 / 손상 알림 및 명시적 해결 배너 */}
       {status !== 'saved' && error && (
         <div className="px-5 py-2.5 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-800/60 flex items-center justify-between gap-3 text-xs text-amber-800 dark:text-amber-300">
           <span className="flex-1">{error}</span>
@@ -90,7 +96,11 @@ export default function MemoPad() {
               onClick={retrySave}
               className="px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold transition-colors"
             >
-              현재 내용으로 저장 재시도
+              {status === 'conflict'
+                ? '내 입력 내용으로 저장'
+                : status === 'corrupted' && !backupSaved
+                  ? '원본 백업 및 복구 재시도'
+                  : '현재 내용으로 저장 재시도'}
             </button>
             {status === 'conflict' && conflictValue !== null && (
               <button

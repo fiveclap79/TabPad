@@ -19,7 +19,7 @@ export default function TodoList() {
   const [
     todos,
     setTodos,
-    { status, error, retrySave, conflictValue, acceptRemoteValue },
+    { status, error, retrySave, conflictValue, acceptRemoteValue, backupSaved },
   ] = useLocalStorage('tabpad_todos', INITIAL_TODOS, {
     validate: validators.todos,
     isEditing: isInputFocused && inputValue.trim().length > 0,
@@ -68,7 +68,13 @@ export default function TodoList() {
           </h2>
           {status !== 'saved' && (
             <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-100 text-amber-700 dark:bg-amber-950/70 dark:text-amber-400">
-              {status === 'error' ? '미저장' : '동기화 확인'}
+              {status === 'error'
+                ? '미저장'
+                : status === 'corrupted' && !backupSaved
+                  ? '백업 실패·차단됨'
+                  : status === 'corrupted'
+                    ? '원본 보존됨'
+                    : '충돌 일시중지'}
             </span>
           )}
         </div>
@@ -87,7 +93,11 @@ export default function TodoList() {
               onClick={retrySave}
               className="px-2 py-0.5 rounded bg-indigo-600 text-white font-semibold hover:bg-indigo-500"
             >
-              저장 재시도
+              {status === 'conflict'
+                ? '내 목록으로 저장'
+                : status === 'corrupted' && !backupSaved
+                  ? '백업 및 복구 재시도'
+                  : '저장 재시도'}
             </button>
             {status === 'conflict' && conflictValue !== null && (
               <button
