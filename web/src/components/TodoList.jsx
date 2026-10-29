@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useLocalStorage } from '../hooks/useLocalStorage';
+import { useLocalStorage, validators } from '../hooks/useLocalStorage';
 
 // 초기 더미 데이터 (투두 리스트)
 const INITIAL_TODOS = [
@@ -10,11 +10,22 @@ const INITIAL_TODOS = [
 
 /**
  * 할 일 관리 컴포넌트 (TodoList)
- * 체크박스 형태의 To-do 리스트 (추가, 완료 취소선, 삭제, localStorage JSON 저장)
+ * 체크박스 형태의 To-do 리스트 (추가, 완료 취소선, 삭제, localStorage JSON 저장, 다중 탭 및 오류 대응)
  */
 export default function TodoList() {
-  const [todos, setTodos] = useLocalStorage('tabpad_todos', INITIAL_TODOS);
   const [inputValue, setInputValue] = useState('');
+  const [isInputFocused, setIsInputFocused] = useState(false);
+
+  const [
+    todos,
+    setTodos,
+    { status, error, retrySave, conflictValue, acceptRemoteValue },
+  ] = useLocalStorage('tabpad_todos', INITIAL_TODOS, {
+    validate: validators.todos,
+    isEditing: isInputFocused && inputValue.trim().length > 0,
+  });
+
+  const safeTodos = Array.isArray(todos) ? todos : [];
 
   // 할 일 추가
   const handleAddTodo = (e) => {
@@ -27,14 +38,14 @@ export default function TodoList() {
       text: trimmed,
       completed: false,
     };
-    setTodos([newTodo, ...todos]);
+    setTodos([newTodo, ...safeTodos]);
     setInputValue('');
   };
 
   // 완료 상태 토글
   const handleToggleTodo = (id) => {
     setTodos(
-      todos.map((todo) =>
+      safeTodos.map((todo) =>
         todo.id === id ? { ...todo, completed: !todo.completed } : todo
       )
     );
@@ -42,28 +53,62 @@ export default function TodoList() {
 
   // 할 일 삭제
   const handleDeleteTodo = (id) => {
-    setTodos(todos.filter((todo) => todo.id !== id));
+    setTodos(safeTodos.filter((todo) => todo.id !== id));
   };
 
-  const completedCount = todos.filter((t) => t.completed).length;
+  const completedCount = safeTodos.filter((t) => t.completed).length;
 
   return (
     <div className="flex flex-col h-full bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm p-4 overflow-hidden">
       <div className="flex items-center justify-between mb-3">
-        <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
-          <span>✅</span>
-          <span>할 일 관리 (To-Do)</span>
-        </h2>
+        <div className="flex items-center gap-1.5">
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
+            <span>✅</span>
+            <span>할 일 관리 (To-Do)</span>
+          </h2>
+          {status !== 'saved' && (
+            <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-100 text-amber-700 dark:bg-amber-950/70 dark:text-amber-400">
+              {status === 'error' ? '미저장' : '동기화 확인'}
+            </span>
+          )}
+        </div>
         <span className="text-xs text-slate-500 dark:text-slate-400 font-medium">
-          {completedCount} / {todos.length} 완료
+          {completedCount} / {safeTodos.length} 완료
         </span>
       </div>
+
+      {/* 저장 오류/충돌 배너 */}
+      {status !== 'saved' && error && (
+        <div className="mb-3 p-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-[11px] text-amber-800 dark:text-amber-300 space-y-1.5">
+          <p>{error}</p>
+          <div className="flex gap-1.5">
+            <button
+              type="button"
+              onClick={retrySave}
+              className="px-2 py-0.5 rounded bg-indigo-600 text-white font-semibold hover:bg-indigo-500"
+            >
+              저장 재시도
+            </button>
+            {status === 'conflict' && conflictValue !== null && (
+              <button
+                type="button"
+                onClick={acceptRemoteValue}
+                className="px-2 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-medium"
+              >
+                다른 탭 목록 적용
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* 할 일 입력 폼 */}
       <form onSubmit={handleAddTodo} className="flex gap-2 mb-3">
         <input
           type="text"
           value={inputValue}
+          onFocus={() => setIsInputFocused(true)}
+          onBlur={() => setIsInputFocused(false)}
           onChange={(e) => setInputValue(e.target.value)}
           placeholder="새로운 할 일을 입력하세요..."
           className="flex-1 min-w-0 px-3 py-1.5 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/70 text-slate-900 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
@@ -78,12 +123,12 @@ export default function TodoList() {
 
       {/* 할 일 목록 */}
       <ul className="flex-1 overflow-y-auto space-y-1.5 pr-1">
-        {todos.length === 0 ? (
+        {safeTodos.length === 0 ? (
           <li className="text-xs text-slate-400 dark:text-slate-500 text-center py-6">
             등록된 할 일이 없습니다.
           </li>
         ) : (
-          todos.map((todo) => (
+          safeTodos.map((todo) => (
             <li
               key={todo.id}
               className="group flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg hover:bg-slate-50 dark:hover:bg-slate-800/60 border border-transparent hover:border-slate-200/70 dark:hover:border-slate-700/60 transition-all"

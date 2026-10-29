@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { useLocalStorage } from './hooks/useLocalStorage';
+import { useLocalStorage, validators } from './hooks/useLocalStorage';
 import ThemeToggle from './components/ThemeToggle';
 import TodoList from './components/TodoList';
 import Snippets from './components/Snippets';
@@ -8,11 +8,16 @@ import AdSenseSlot from './components/AdSenseSlot';
 
 /**
  * TabPad 메인 레이아웃 및 테마 프로바이더
- * - 테마 시스템: 'system'(시스템 기본값), 'light'(라이트 모드), 'dark'(다크 모드)
+ * - 테마 시스템: 'system'(시스템 기본값), 'light'(라이트 모드), 'dark'(다크 모드) 스키마 검증 포함
  * - 레이아웃: 좌측 사이드바 30%(투두/상용구) - 우측 메인 70%(메모장) + 하단 애드센스 슬롯
  */
 export default function App() {
-  const [theme, setTheme] = useLocalStorage('tabpad_theme', 'system');
+  const [theme, setTheme, { status: themeStatus, error: themeError, retrySave: retryThemeSave }] =
+    useLocalStorage('tabpad_theme', 'system', {
+      validate: validators.theme,
+    });
+
+  const safeTheme = validators.theme(theme) ? theme : 'system';
 
   // 테마 변경 및 시스템 다크모드 감지 적용
   useEffect(() => {
@@ -21,7 +26,7 @@ export default function App() {
 
     const applyTheme = () => {
       const isDark =
-        theme === 'dark' || (theme === 'system' && mediaQuery.matches);
+        safeTheme === 'dark' || (safeTheme === 'system' && mediaQuery.matches);
       if (isDark) {
         root.classList.add('dark');
       } else {
@@ -33,14 +38,14 @@ export default function App() {
 
     // 시스템 기본값 모드일 때 OS 테마 변경 실시간 반영
     const listener = () => {
-      if (theme === 'system') {
+      if (safeTheme === 'system') {
         applyTheme();
       }
     };
 
     mediaQuery.addEventListener('change', listener);
     return () => mediaQuery.removeEventListener('change', listener);
-  }, [theme]);
+  }, [safeTheme]);
 
   return (
     <div className="min-h-screen h-screen flex flex-col bg-slate-100 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
@@ -60,8 +65,20 @@ export default function App() {
           </div>
         </div>
 
-        {/* 테마 토글 버튼 (시스템 기본값 / 라이트 모드 / 다크 모드) */}
-        <ThemeToggle theme={theme} setTheme={setTheme} />
+        <div className="flex items-center gap-3">
+          {themeStatus !== 'saved' && themeError && (
+            <button
+              type="button"
+              onClick={retryThemeSave}
+              className="text-xs px-2.5 py-1 rounded bg-amber-100 dark:bg-amber-950/70 text-amber-800 dark:text-amber-300 font-medium"
+              title={themeError}
+            >
+              ⚠️ 테마 저장 재시도
+            </button>
+          )}
+          {/* 테마 토글 버튼 (시스템 기본값 / 라이트 모드 / 다크 모드) */}
+          <ThemeToggle theme={safeTheme} setTheme={setTheme} />
+        </div>
       </header>
 
       {/* 메인 워크스페이스 (좌측 30% 사이드바 / 우측 70% 메모장) */}
@@ -82,7 +99,7 @@ export default function App() {
         </section>
       </main>
 
-      {/* 하단 구글 애드센스 슬롯 영역 */}
+      {/* 하단 구글 애드센스 슬롯 영역 (정책 검토 전까지 Placeholder 유지) */}
       <footer className="px-6 pb-4 shrink-0">
         <AdSenseSlot />
       </footer>

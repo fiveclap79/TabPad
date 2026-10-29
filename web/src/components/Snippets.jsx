@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { useLocalStorage } from '../hooks/useLocalStorage';
+import React, { useState, useRef, useEffect } from 'react';
+import { useLocalStorage, validators } from '../hooks/useLocalStorage';
 
 // 초기 더미 데이터 (자주 쓰는 상용구)
 const INITIAL_SNIPPETS = [
@@ -22,24 +22,66 @@ const INITIAL_SNIPPETS = [
 
 /**
  * 상용구 클립보드 원클릭 복사 컴포넌트 (Snippets)
- * 클릭 시 navigator.clipboard.writeText() 실행 및 "복사되었습니다!" 토스트 알림 2초간 표시
+ * - 클릭 시 navigator.clipboard.writeText() 실행
+ * - 타이머를 ref로 관리하여 재복사 시 이전 타이머 초기화(마지막 성공 시점부터 정확히 2초간 표시) 및 unmount 시 정리
+ * - 복사 실패 시에도 실패 토스트 메시지 제공
  */
 export default function Snippets() {
-  const [snippets, setSnippets] = useLocalStorage('tabpad_snippets', INITIAL_SNIPPETS);
   const [titleInput, setTitleInput] = useState('');
   const [textInput, setTextInput] = useState('');
-  const [toastMessage, setToastMessage] = useState('');
+  const [isInputFocused, setIsInputFocused] = useState(false);
+
+  // 토스트 상태: { message: string, type: 'success' | 'error' } | null
+  const [toast, setToast] = useState(null);
+  const toastTimerRef = useRef(null);
+
+  const [
+    snippets,
+    setSnippets,
+    { status, error, retrySave, conflictValue, acceptRemoteValue },
+  ] = useLocalStorage('tabpad_snippets', INITIAL_SNIPPETS, {
+    validate: validators.snippets,
+    isEditing:
+      isInputFocused &&
+      (titleInput.trim().length > 0 || textInput.trim().length > 0),
+  });
+
+  const safeSnippets = Array.isArray(snippets) ? snippets : [];
+
+  // 컴포넌트 unmount 시 토스트 타이머 정리
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // 토스트 표시 헬퍼 (재호출 시 기존 타이머 취소 후 새로 2초 카운트)
+  const showToast = (message, type = 'success') => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    setToast({ message, type });
+    toastTimerRef.current = setTimeout(() => {
+      setToast(null);
+      toastTimerRef.current = null;
+    }, 2000);
+  };
 
   // 클립보드 원클릭 복사 핸들러
   const handleCopy = async (text) => {
     try {
+      if (!navigator?.clipboard?.writeText) {
+        throw new Error('클립보드 API를 지원하지 않는 환경입니다.');
+      }
       await navigator.clipboard.writeText(text);
-      setToastMessage('복사되었습니다!');
-      setTimeout(() => {
-        setToastMessage('');
-      }, 2000);
+      showToast('복사되었습니다!', 'success');
     } catch (err) {
       console.error('클립보드 복사 실패:', err);
+      showToast('복사에 실패했습니다. 브라우저 권한을 확인해 주세요.', 'error');
     }
   };
 
@@ -54,7 +96,7 @@ export default function Snippets() {
       title: titleInput.trim() || trimmedText.slice(0, 16),
       text: trimmedText,
     };
-    setSnippets([newSnippet, ...snippets]);
+    setSnippets([newSnippet, ...safeSnippets]);
     setTitleInput('');
     setTextInput('');
   };
@@ -62,27 +104,66 @@ export default function Snippets() {
   // 상용구 삭제 핸들러
   const handleDeleteSnippet = (e, id) => {
     e.stopPropagation();
-    setSnippets(snippets.filter((item) => item.id !== id));
+    setSnippets(safeSnippets.filter((item) => item.id !== id));
   };
 
   return (
     <div className="relative flex flex-col h-full bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm p-4 overflow-hidden">
-      {/* 2초간 표시되는 토스트 알림 */}
-      {toastMessage && (
-        <div className="absolute top-3 right-3 z-20 px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-semibold shadow-lg animate-bounce">
-          📋 {toastMessage}
+      {/* 마지막 복사 시점부터 2초간 표시되는 토스트 알림 (성공 / 실패) */}
+      {toast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`absolute top-3 right-3 z-20 px-3 py-1.5 rounded-lg text-white text-xs font-semibold shadow-lg transition-all ${
+            toast.type === 'error' ? 'bg-rose-600' : 'bg-indigo-600'
+          }`}
+        >
+          {toast.type === 'error' ? '⚠️ ' : '📋 '}
+          {toast.message}
         </div>
       )}
 
       <div className="flex items-center justify-between mb-3">
-        <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
-          <span>⚡</span>
-          <span>상용구 원클릭 복사 (Snippets)</span>
-        </h2>
+        <div className="flex items-center gap-1.5">
+          <h2 className="text-sm font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
+            <span>⚡</span>
+            <span>상용구 원클릭 복사 (Snippets)</span>
+          </h2>
+          {status !== 'saved' && (
+            <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-100 text-amber-700 dark:bg-amber-950/70 dark:text-amber-400">
+              {status === 'error' ? '미저장' : '동기화 확인'}
+            </span>
+          )}
+        </div>
         <span className="text-xs text-slate-400 dark:text-slate-500">
           클릭하여 복사
         </span>
       </div>
+
+      {/* 저장 오류/충돌 배너 */}
+      {status !== 'saved' && error && (
+        <div className="mb-3 p-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-[11px] text-amber-800 dark:text-amber-300 space-y-1.5">
+          <p>{error}</p>
+          <div className="flex gap-1.5">
+            <button
+              type="button"
+              onClick={retrySave}
+              className="px-2 py-0.5 rounded bg-indigo-600 text-white font-semibold hover:bg-indigo-500"
+            >
+              저장 재시도
+            </button>
+            {status === 'conflict' && conflictValue !== null && (
+              <button
+                type="button"
+                onClick={acceptRemoteValue}
+                className="px-2 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-medium"
+              >
+                다른 탭 목록 적용
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* 상용구 등록 폼 */}
       <form onSubmit={handleAddSnippet} className="space-y-2 mb-3">
@@ -90,6 +171,8 @@ export default function Snippets() {
           <input
             type="text"
             value={titleInput}
+            onFocus={() => setIsInputFocused(true)}
+            onBlur={() => setIsInputFocused(false)}
             onChange={(e) => setTitleInput(e.target.value)}
             placeholder="제목 (선택)"
             className="w-1/3 px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/70 text-slate-900 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
@@ -97,6 +180,8 @@ export default function Snippets() {
           <input
             type="text"
             value={textInput}
+            onFocus={() => setIsInputFocused(true)}
+            onBlur={() => setIsInputFocused(false)}
             onChange={(e) => setTextInput(e.target.value)}
             placeholder="자주 쓰는 문구를 입력하세요..."
             className="flex-1 min-w-0 px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/70 text-slate-900 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
@@ -112,12 +197,12 @@ export default function Snippets() {
 
       {/* 상용구 목록 */}
       <div className="flex-1 overflow-y-auto space-y-2 pr-1">
-        {snippets.length === 0 ? (
+        {safeSnippets.length === 0 ? (
           <p className="text-xs text-slate-400 dark:text-slate-500 text-center py-6">
             등록된 상용구가 없습니다.
           </p>
         ) : (
-          snippets.map((item) => (
+          safeSnippets.map((item) => (
             <div
               key={item.id}
               onClick={() => handleCopy(item.text)}
