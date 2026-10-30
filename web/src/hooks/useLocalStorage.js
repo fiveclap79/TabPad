@@ -42,7 +42,7 @@ const TAB_ID = `tab_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
  * 손상된 원본 문자열을 백업 키에 안전하게 보존 시도하고 성공 여부를 반환
  */
 function tryBackupCorruptedRaw(key, raw) {
-  const candidateKey = `${key}__corrupted_backup_${Date.now()}`;
+  const candidateKey = `${key}__corrupted_backup_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   try {
     window.localStorage.setItem(candidateKey, raw);
     const verify = window.localStorage.getItem(candidateKey);
@@ -53,6 +53,38 @@ function tryBackupCorruptedRaw(key, raw) {
     // 백업 저장 실패 (QuotaExceededError 등)
   }
   return { backupSaved: false, backupKey: null };
+}
+
+/**
+ * 현재 localStorage의 실제 저장값을 다시 읽고 JSON 파싱 및 스키마 유효성을 검증하는 헬퍼
+ */
+function inspectCurrentStorage(key, validate) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) {
+      return { raw: null, isCorrupted: false, isValid: false, parsed: null };
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      const isValid = validate ? Boolean(validate(parsed)) : true;
+      return {
+        raw,
+        isCorrupted: !isValid,
+        isValid,
+        parsed: isValid ? parsed : null,
+      };
+    } catch {
+      return { raw, isCorrupted: true, isValid: false, parsed: null };
+    }
+  } catch (err) {
+    return {
+      raw: null,
+      isCorrupted: false,
+      isValid: false,
+      parsed: null,
+      readError: err?.message || '로컬 스토리지 읽기 오류',
+    };
+  }
 }
 
 /**
@@ -129,8 +161,12 @@ function loadInitialStorageState(key, initialValue, validate) {
  *    표시용 `status`와 완전히 분리하여, 외부 JSON/스키마 오류가 중간에 발생하더라도 기존 저장 차단 조건을 엄격히 유지함
  * 2. 충돌 중 손상된 외부 값을 받더라도 기존 유효 충돌 후보(`conflictValue`)를 보존하며,
  *    사용자의 명시적 해결 전 추가 입력(`setValue`)은 절대 저장하지 않음 (쓰기 0회)
- * 3. 백업하지 못한 원본(`needsRawBackup && corruptedRaw !== null`)이 남아 있으면 현재 `status`와 무관하게
- *    `setValue`와 `retrySave` 모두 원본을 백업 키에 안전하게 확보하기 전에는 원본 키 덮어쓰기를 차단함
+ * 3. `acceptRemoteValue()` 호출 시 현재 `localStorage`의 실제 값을 다시 읽고 검증하여:
+ *    - 실제 저장값이 선택한 충돌 후보(`conflictValue`)와 일치하고 미백업 원본이 없을 때만 쓰기(0회) 없이 `saved`로 전환함
+ *    - 만약 실제 저장값이 손상되었거나 후보와 다르면, 후보를 화면 값으로 적용하되 후보(`conflictValue`)를 보존하고
+ *      미저장 상태(`error` 또는 `corrupted`)를 표시하여 사용자가 명시적 복구 저장(`retrySave`)을 수행하도록 안내함
+ * 4. 명시적 복구 저장(`retrySave`) 과정에서는 기존 미백업 원본뿐 아니라 현재 `localStorage`에 들어 있는 손상된 저장값까지
+ *    재확인하여 안전하게 백업하고, 기록 후 실제 저장 일치 검증まで 통과해야만 `saved`로 전환함 (실패 시 후보 및 미저장 상태 유지)
  *
  * @param {string} key - localStorage 키 이름
  * @param {any} initialValue - 초기 기본값
@@ -157,7 +193,7 @@ export function useLocalStorage(key, initialValue, options = {}) {
     isEditingRef.current = isEditing;
   }, [isEditing]);
 
-  // 실제 localStorage에 값을 기록하는 순수 헬퍼
+  // 실제 localStorage에 값을 기록하고 다시 읽어 저장 성공 여부를 검증하는 헬퍼
   const writeToStorage = useCallback(
     (valueToSave) => {
       if (validate && !validate(valueToSave)) {
@@ -174,6 +210,14 @@ export function useLocalStorage(key, initialValue, options = {}) {
           metaKey,
           JSON.stringify({ updatedAt: now, tabId: TAB_ID })
         );
+        // 실제 저장값 재검증
+        const verifyRaw = window.localStorage.getItem(key);
+        if (verifyRaw !== serialized) {
+          return {
+            ok: false,
+            error: '로컬 스토리지 저장 후 검증에 실패했습니다.',
+          };
+        }
         return { ok: true, error: null };
       } catch (err) {
         return {
@@ -190,7 +234,7 @@ export function useLocalStorage(key, initialValue, options = {}) {
   // 로컬 사용자 변경 핸들러:
   // - 표시용 status와 무관하게 hasUnresolvedConflict === true 이면 사용자의 명시적 해결 전까지 자동 저장을 차단하고
   //   기존 conflictValue 후보와 충돌 차단 상태를 유지함
-  // - 표시용 status와 무관하게 needsRawBackup === true (또는 미백업 corruptedRaw 존재) 이면,
+  // - 표시용 status와 무관하게 미백업 원본이 존재하거나 현재 스토리지에 손상된 원본이 있으면,
   //   원본 백업을 먼저 시도하고 실패 시 원본 키 덮어쓰기를 차단함
   const setValue = useCallback(
     (valOrUpdater) => {
@@ -221,6 +265,27 @@ export function useLocalStorage(key, initialValue, options = {}) {
       let currentBackupKey = prev.backupKey;
       let currentCorruptedRaw = prev.corruptedRaw;
       let currentNeedsRawBackup = prev.needsRawBackup;
+
+      // 현재 localStorage에 백업되지 않은 새로운 손상값이 들어 있는지도 함께 점검
+      const diskCheck = inspectCurrentStorage(key, validate);
+      if (diskCheck.isCorrupted && diskCheck.raw !== null) {
+        const alreadyBackedUp =
+          currentBackupSaved &&
+          currentBackupKey &&
+          (() => {
+            try {
+              return window.localStorage.getItem(currentBackupKey) === diskCheck.raw;
+            } catch {
+              return false;
+            }
+          })();
+
+        if (!alreadyBackedUp) {
+          currentCorruptedRaw = diskCheck.raw;
+          currentNeedsRawBackup = true;
+          currentBackupSaved = false;
+        }
+      }
 
       if (currentNeedsRawBackup && currentCorruptedRaw !== null) {
         const backupAttempt = tryBackupCorruptedRaw(key, currentCorruptedRaw);
@@ -275,13 +340,14 @@ export function useLocalStorage(key, initialValue, options = {}) {
       stateRef.current = nextState;
       setState(nextState);
     },
-    [key, writeToStorage]
+    [key, validate, writeToStorage]
   );
 
-  // 명시적 해결 1 / 재시도 함수:
-  // - 현재 status와 무관하게 미백업 원본(needsRawBackup && corruptedRaw !== null)이 남아 있으면
-  //   원본 백업을 먼저 완수하기 전에는 절대 원본 키에 복구/재시도 저장을 수행하지 않음
-  // - 백업이 확보된 뒤 로컬 값을 저장하며, 성공 시 미해결 충돌(hasUnresolvedConflict)도 함께 해소됨
+  // 명시적 해결 1 / 복구 저장 재시도 함수 (retrySave):
+  // - 기존 미백업 원본(needsRawBackup)뿐만 아니라 현재 localStorage에 들어 있는 손상값도 다시 확인하여
+  //   백업이 완료되기 전에는 절대 원본 키를 덮어쓰지 않음
+  // - 저장을 수행하고 실제 저장 성공 확인까지 통과해야만 saved로 전환하며,
+  //   실패 시 기존 conflictValue 후보와 미저장 상태(error/corrupted/conflict)를 그대로 유지함
   const retrySave = useCallback(() => {
     const prev = stateRef.current;
     let currentBackupSaved = prev.backupSaved;
@@ -289,6 +355,28 @@ export function useLocalStorage(key, initialValue, options = {}) {
     let currentCorruptedRaw = prev.corruptedRaw;
     let currentNeedsRawBackup = prev.needsRawBackup;
 
+    // 1) 현재 실제 localStorage에 손상된 값이 들어 있는지 재검사하여 백업 대상에 포함
+    const diskCheck = inspectCurrentStorage(key, validate);
+    if (diskCheck.isCorrupted && diskCheck.raw !== null) {
+      const alreadyBackedUp =
+        currentBackupSaved &&
+        currentBackupKey &&
+        (() => {
+          try {
+            return window.localStorage.getItem(currentBackupKey) === diskCheck.raw;
+          } catch {
+            return false;
+          }
+        })();
+
+      if (!alreadyBackedUp) {
+        currentCorruptedRaw = diskCheck.raw;
+        currentNeedsRawBackup = true;
+        currentBackupSaved = false;
+      }
+    }
+
+    // 2) 백업이 필요한 손상 원본이 있다면 먼저 백업을 수행하고, 실패 시 덮어쓰기 차단 (후보 및 미저장 상태 유지)
     if (currentNeedsRawBackup && currentCorruptedRaw !== null) {
       const backupAttempt = tryBackupCorruptedRaw(key, currentCorruptedRaw);
       if (!backupAttempt.backupSaved) {
@@ -299,6 +387,7 @@ export function useLocalStorage(key, initialValue, options = {}) {
           backupKey: null,
           needsRawBackup: true,
           corruptedRaw: currentCorruptedRaw,
+          // conflictValue 및 hasUnresolvedConflict 그대로 보존
           error:
             '원본 백업 저장에 여전히 실패했습니다. 원본을 안전하게 확보하기 전에는 복구 저장으로 덮어쓰지 않습니다.',
         };
@@ -312,54 +401,132 @@ export function useLocalStorage(key, initialValue, options = {}) {
       currentNeedsRawBackup = false;
     }
 
+    // 3) 백업이 안전하게 확보된 후 현재 화면 값(또는 적용된 후보 값)을 localStorage에 저장 및 검증
     lastLocalEditTimeRef.current = Date.now();
     const writeResult = writeToStorage(prev.value);
-    const nextState = writeResult.ok
-      ? {
-          ...prev,
-          status: 'saved',
-          error: null,
-          hasUnresolvedConflict: false,
-          conflictValue: null,
-          backupSaved: currentBackupSaved,
-          backupKey: currentBackupKey,
-          corruptedRaw: null,
-          needsRawBackup: false,
-        }
-      : {
-          ...prev,
-          status: prev.hasUnresolvedConflict ? 'conflict' : 'error',
-          error: writeResult.error,
-          backupSaved: currentBackupSaved,
-          backupKey: currentBackupKey,
-          corruptedRaw: currentCorruptedRaw,
-          needsRawBackup: currentNeedsRawBackup,
-        };
+    if (!writeResult.ok) {
+      // 복구 저장 실패 시에도 후보(conflictValue)와 미저장 상태를 유지
+      const failedWriteState = {
+        ...prev,
+        status: prev.hasUnresolvedConflict ? 'conflict' : 'error',
+        error: writeResult.error,
+        backupSaved: currentBackupSaved,
+        backupKey: currentBackupKey,
+        corruptedRaw: currentCorruptedRaw,
+        needsRawBackup: currentNeedsRawBackup,
+        // conflictValue 및 hasUnresolvedConflict 그대로 유지
+      };
+      stateRef.current = failedWriteState;
+      setState(failedWriteState);
+      return false;
+    }
 
-    stateRef.current = nextState;
-    setState(nextState);
-    return writeResult.ok;
-  }, [key, writeToStorage]);
-
-  // 명시적 해결 2: 충돌(conflict) 발생 시 "외부 탭의 유효한 값을 적용"하여 해결 (localStorage 재저장 없음)
-  const acceptRemoteValue = useCallback(() => {
-    const prev = stateRef.current;
-    if (!prev.hasUnresolvedConflict || prev.conflictValue === null) return false;
-
-    const nextState = {
+    const savedState = {
       ...prev,
-      value: prev.conflictValue,
+      status: 'saved',
+      error: null,
       hasUnresolvedConflict: false,
       conflictValue: null,
-      status: prev.needsRawBackup ? 'corrupted' : 'saved',
-      error: prev.needsRawBackup
-        ? '충돌은 해결되었으나 미백업 손상 원본 보호가 유지 중입니다.'
-        : null,
+      backupSaved: currentBackupSaved,
+      backupKey: currentBackupKey,
+      corruptedRaw: null,
+      needsRawBackup: false,
     };
-    stateRef.current = nextState;
-    setState(nextState);
+    stateRef.current = savedState;
+    setState(savedState);
     return true;
-  }, []);
+  }, [key, validate, writeToStorage]);
+
+  // 명시적 해결 2: 충돌(conflict) 발생 시 "외부 탭의 후보 값을 적용" (acceptRemoteValue)
+  // - 현재 localStorage 값을 다시 읽고 검증하여, 실제 저장값이 선택한 충돌 후보(conflictValue)와
+  //   일치하고 미백업 원본이 없을 때만 쓰기(0회) 없이 saved로 전환함
+  // - 만약 실제 저장값이 손상되었거나 후보와 다르면, 화면 값에는 후보를 반영하되 후보(conflictValue)를 삭제하지 않고 보존하며,
+  //   미저장 상태(error 또는 corrupted)를 표시하여 명시적 복구 저장(retrySave)을 통해 백업 및 저장이 수행되도록 함
+  const acceptRemoteValue = useCallback(() => {
+    const prev = stateRef.current;
+    if (prev.conflictValue === null) return false;
+
+    const candidate = prev.conflictValue;
+    const candidateSerialized = JSON.stringify(candidate);
+    const diskCheck = inspectCurrentStorage(key, validate);
+
+    // 1) 현재 localStorage의 실제 저장값이 손상된 경우 -> 손상 원본을 백업 대상으로 등록하고, 후보 보존 및 미저장 상태 표시
+    if (diskCheck.isCorrupted) {
+      let currentCorruptedRaw = prev.corruptedRaw;
+      let currentNeedsRawBackup = prev.needsRawBackup;
+      let currentBackupSaved = prev.backupSaved;
+      const currentBackupKey = prev.backupKey;
+
+      const alreadyBackedUp =
+        currentBackupSaved &&
+        currentBackupKey &&
+        (() => {
+          try {
+            return window.localStorage.getItem(currentBackupKey) === diskCheck.raw;
+          } catch {
+            return false;
+          }
+        })();
+
+      if (!alreadyBackedUp && diskCheck.raw !== null) {
+        currentCorruptedRaw = diskCheck.raw;
+        currentNeedsRawBackup = true;
+        currentBackupSaved = false;
+      }
+
+      const corruptedDiskState = {
+        ...prev,
+        value: candidate,
+        // 후보를 보존하고 미저장 상태 표시
+        conflictValue: candidate,
+        hasUnresolvedConflict: false,
+        corruptedRaw: currentCorruptedRaw,
+        needsRawBackup: currentNeedsRawBackup,
+        backupSaved: currentBackupSaved,
+        status: currentNeedsRawBackup ? 'corrupted' : 'error',
+        error:
+          '선택한 후보를 화면에 적용했으나 현재 로컬 스토리지의 실제 저장값이 손상되어 있습니다. 원본 백업 및 복구 저장을 위해 [저장 재시도]를 눌러주세요.',
+      };
+      stateRef.current = corruptedDiskState;
+      setState(corruptedDiskState);
+      return false;
+    }
+
+    // 2) 현재 localStorage의 실제 저장값이 유효하지만 선택한 충돌 후보와 일치하지 않거나, 미백업 원본이 남아 있는 경우
+    const matchesStorage =
+      diskCheck.isValid &&
+      JSON.stringify(diskCheck.parsed) === candidateSerialized;
+
+    if (!matchesStorage || prev.needsRawBackup) {
+      const mismatchState = {
+        ...prev,
+        value: candidate,
+        // 후보를 보존하고 미저장 상태 표시
+        conflictValue: candidate,
+        hasUnresolvedConflict: false,
+        status: prev.needsRawBackup ? 'corrupted' : 'error',
+        error: prev.needsRawBackup
+          ? '선택한 후보를 화면에 적용했으나 미백업 손상 원본이 남아 있어 아직 저장되지 않았습니다. [원본 백업 및 복구 재시도]를 눌러주세요.'
+          : '선택한 후보를 화면에 적용했으나 현재 로컬 스토리지의 실제 저장값과 일치하지 않아 미저장 상태입니다. [저장 재시도]를 눌러 확정해 주세요.',
+      };
+      stateRef.current = mismatchState;
+      setState(mismatchState);
+      return false;
+    }
+
+    // 3) 현재 localStorage의 실제 저장값이 유효하고 선택한 충돌 후보와 정확히 일치할 때만 쓰기 없이 saved로 전환
+    const matchedState = {
+      ...prev,
+      value: candidate,
+      hasUnresolvedConflict: false,
+      conflictValue: null,
+      status: 'saved',
+      error: null,
+    };
+    stateRef.current = matchedState;
+    setState(matchedState);
+    return true;
+  }, [key, validate]);
 
   // 다중 탭 storage 이벤트 리스너 (외부 값 수신만으로는 절대 localStorage에 다시 쓰지 않음)
   useEffect(() => {
@@ -372,20 +539,22 @@ export function useLocalStorage(key, initialValue, options = {}) {
       try {
         const parsed = JSON.parse(e.newValue);
         if (validate && !validate(parsed)) {
-          // 다른 탭에서 스키마 불일치 손상값이 들어온 경우:
-          // 기존의 hasUnresolvedConflict, conflictValue, needsRawBackup, corruptedRaw를 절대 덮어쓰거나 해제하지 않고 보존!
+          // 다른 탭에서 스키마 불일치 손상값이 실제 저장소에 기록된 경우:
+          // 기존의 hasUnresolvedConflict, conflictValue, needsRawBackup, corruptedRaw를 보존하면서
+          // 아직 미백업 원본이 없다면 이 손상값도 백업 보호 대상으로 추적함
+          const nextCorruptedRaw =
+            current.needsRawBackup && current.corruptedRaw !== null
+              ? current.corruptedRaw
+              : e.newValue;
           const invalidRemoteState = {
             ...current,
-            status: current.hasUnresolvedConflict
-              ? 'conflict'
-              : current.needsRawBackup
-                ? 'corrupted'
-                : 'error',
+            corruptedRaw: nextCorruptedRaw,
+            needsRawBackup: true,
+            backupSaved: false,
+            status: current.hasUnresolvedConflict ? 'conflict' : 'corrupted',
             error: current.hasUnresolvedConflict
-              ? '충돌 해결 대기 중 다른 탭에서 유효하지 않은 형식의 데이터가 감지되어 무시했습니다. 기존 충돌 후보가 유지됩니다.'
-              : current.needsRawBackup
-                ? '원본 백업 대기 중 다른 탭에서 유효하지 않은 데이터가 감지되었습니다. 원본 확보 전 덮어쓰기 차단이 유지됩니다.'
-                : '다른 탭에서 유효하지 않은 형식의 데이터가 감지되어 반영하지 않았습니다.',
+              ? '충돌 해결 대기 중 다른 탭에서 유효하지 않은 형식의 데이터가 저장소에 기록되었습니다. 기존 충돌 후보가 유지되며 복구 저장 시 손상값이 먼저 백업됩니다.'
+              : '다른 탭에서 유효하지 않은 형식의 데이터가 감지되어 덮어쓰기 차단이 활성화되었습니다.',
           };
           stateRef.current = invalidRemoteState;
           setState(invalidRemoteState);
@@ -455,20 +624,21 @@ export function useLocalStorage(key, initialValue, options = {}) {
         stateRef.current = syncedState;
         setState(syncedState);
       } catch {
-        // 다른 탭에서 JSON 파싱 불가능한 손상 문자열이 들어온 경우:
-        // 기존의 hasUnresolvedConflict, conflictValue, needsRawBackup, corruptedRaw를 모두 그대로 보존!
+        // 다른 탭에서 JSON 파싱 불가능한 손상 문자열이 실제 저장소에 기록된 경우:
+        // 기존의 hasUnresolvedConflict, conflictValue를 보존하고 손상된 원문을 백업 보호 대상으로 등록
+        const nextCorruptedRaw =
+          current.needsRawBackup && current.corruptedRaw !== null
+            ? current.corruptedRaw
+            : e.newValue;
         const parseErrState = {
           ...current,
-          status: current.hasUnresolvedConflict
-            ? 'conflict'
-            : current.needsRawBackup
-              ? 'corrupted'
-              : 'error',
+          corruptedRaw: nextCorruptedRaw,
+          needsRawBackup: true,
+          backupSaved: false,
+          status: current.hasUnresolvedConflict ? 'conflict' : 'corrupted',
           error: current.hasUnresolvedConflict
-            ? '충돌 해결 대기 중 다른 탭에서 손상된 JSON 데이터가 감지되어 무시했습니다. 기존 충돌 후보가 유지됩니다.'
-            : current.needsRawBackup
-              ? '원본 백업 대기 중 다른 탭에서 손상된 JSON 데이터가 감지되었습니다. 원본 확보 전 덮어쓰기 차단이 유지됩니다.'
-              : '다른 탭에서 손상된 데이터가 감지되어 반영하지 않았습니다.',
+            ? '충돌 해결 대기 중 다른 탭에서 손상된 JSON 데이터가 저장소에 기록되었습니다. 기존 충돌 후보가 유지되며 복구 저장 시 손상값이 먼저 백업됩니다.'
+            : '다른 탭에서 손상된 JSON 데이터가 감지되어 덮어쓰기 차단이 활성화되었습니다.',
         };
         stateRef.current = parseErrState;
         setState(parseErrState);
