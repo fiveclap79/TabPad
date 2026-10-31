@@ -9,7 +9,7 @@
     "build:web": "vite build --mode web",
     "build:extension": "vite build --mode extension --outDir dist-extension && node scripts/sync-extension.mjs",
     "lint": "oxlint",
-    "test": "node tests/useLocalStorage.react.test.mjs && node tests/verify_audit.mjs",
+    "test": "node tests/useLocalStorage.react.test.mjs && node tests/dataTransfer.test.mjs && node tests/verify_audit.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -24,6 +24,7 @@
     "jsdom": "^25.0.1",
     "oxlint": "^1.89.0",
     "postcss": "^8.5.32",
+    "puppeteer": "^25.16.0",
     "tailwindcss": "^3.4.19",
     "vite": "^8.3.5"
   }

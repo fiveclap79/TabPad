@@ -1,5 +1,5 @@
 import React, { useRef, useState } from 'react';
-import { validators } from '../hooks/useLocalStorage';
+import { executeAtomicImport } from '../utils/dataTransfer';
 
 /**
  * 웹 버전(https://web-seven-wine-12.vercel.app) <-> 내장형 확장 프로그램(chrome-extension://...) 간
@@ -60,7 +60,7 @@ export default function DataTransferModal() {
     }
   };
 
-  // JSON 파일 선택 시 스키마 검증 후 현재 출처(Origin)의 localStorage에 복원
+  // JSON 파일 선택 시 스키마 검증 후 현재 출처(Origin)의 localStorage에 원자적 복원
   const handleImportFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -68,63 +68,11 @@ export default function DataTransferModal() {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text);
-      const data = parsed?.data || parsed;
-
-      if (!data || typeof data !== 'object') {
-        throw new Error('유효한 TabPad 백업 파일 형식이 아닙니다.');
-      }
-
-      const nextEntries = [];
-      if (data.tabpad_memo !== undefined && data.tabpad_memo !== null) {
-        if (!validators.memo(data.tabpad_memo)) {
-          throw new Error('백업 파일의 메모(tabpad_memo) 형식이 올바르지 않습니다.');
-        }
-        nextEntries.push(['tabpad_memo', data.tabpad_memo]);
-      }
-      if (data.tabpad_todos !== undefined && data.tabpad_todos !== null) {
-        if (!validators.todos(data.tabpad_todos)) {
-          throw new Error('백업 파일의 할 일 목록(tabpad_todos) 형식이 올바르지 않습니다.');
-        }
-        nextEntries.push(['tabpad_todos', data.tabpad_todos]);
-      }
-      if (data.tabpad_snippets !== undefined && data.tabpad_snippets !== null) {
-        if (!validators.snippets(data.tabpad_snippets)) {
-          throw new Error('백업 파일의 상용구 목록(tabpad_snippets) 형식이 올바르지 않습니다.');
-        }
-        nextEntries.push(['tabpad_snippets', data.tabpad_snippets]);
-      }
-      if (data.tabpad_theme !== undefined && data.tabpad_theme !== null) {
-        if (!validators.theme(data.tabpad_theme)) {
-          throw new Error('백업 파일의 테마(tabpad_theme) 형식이 올바르지 않습니다.');
-        }
-        nextEntries.push(['tabpad_theme', data.tabpad_theme]);
-      }
-
-      if (nextEntries.length === 0) {
-        throw new Error('가져올 수 있는 유효한 TabPad 데이터가 없습니다.');
-      }
-
-      const now = Date.now();
-      for (const [key, val] of nextEntries) {
-        const serialized = JSON.stringify(val);
-        window.localStorage.setItem(key, serialized);
-        window.localStorage.setItem(
-          `${key}__meta`,
-          JSON.stringify({ updatedAt: now, tabId: 'import_restore' })
-        );
-        // 같은 탭 및 다른 탭에 즉시 반영되도록 storage 이벤트 발생
-        window.dispatchEvent(
-          new StorageEvent('storage', {
-            key,
-            newValue: serialized,
-            storageArea: window.localStorage,
-          })
-        );
-      }
+      const result = await executeAtomicImport(parsed);
 
       setNotice({
         type: 'success',
-        text: `총 ${nextEntries.length}개 항목을 성공적으로 가져왔습니다.`,
+        text: `총 ${result.count}개 항목을 성공적으로 가져왔습니다.`,
       });
     } catch (err) {
       setNotice({

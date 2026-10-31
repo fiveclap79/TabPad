@@ -39,6 +39,85 @@ export const validators = {
 const TAB_ID = `tab_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 /**
+ * 현재 활성화된(마운트된) useLocalStorage 훅 인스턴스 레지스트리
+ * - 데이터 가져오기(DataTransferModal) 전 편집 중이거나 충돌/오류/미백업 상태가 있는지 안전성 점검에 사용
+ */
+const activeHookRegistry = new Map();
+
+/**
+ * 훅 인스턴스 등록 함수
+ */
+export function registerHookInstance(key, instance) {
+  activeHookRegistry.set(key, instance);
+  return () => {
+    if (activeHookRegistry.get(key) === instance) {
+      activeHookRegistry.delete(key);
+    }
+  };
+}
+
+/**
+ * 데이터 가져오기(Import) 전 스토리지 안전성 검사
+ * - 활성 훅 인스턴스 상태(편집 중, 미해결 충돌, 미백업 손상 원본, 저장 오류)를 점검
+ * - 스토리지 디스크(localStorage)의 손상 원본 존재 여부를 점검
+ * - 하나라도 안전하지 않은 조건이 있으면 저장을 차단하고 구체적인 사유를 반환
+ */
+export function checkStorageSafetyForImport(keysToCheck = ['tabpad_memo', 'tabpad_todos', 'tabpad_snippets', 'tabpad_theme']) {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return { safe: false, reason: '로컬 스토리지를 사용할 수 없는 환경입니다.' };
+  }
+
+  for (const key of keysToCheck) {
+    // 1. 활성 훅 인스턴스 상태 검사
+    const hook = activeHookRegistry.get(key);
+    if (hook) {
+      const state = hook.getState ? hook.getState() : null;
+      const isEditing = hook.getIsEditing ? hook.getIsEditing() : false;
+
+      if (isEditing) {
+        return {
+          safe: false,
+          reason: `'${key}' 항목이 현재 편집 중입니다. 먼저 저장을 완료하거나 편집을 마친 후 가져오기를 실행해 주세요.`,
+        };
+      }
+      if (state) {
+        if (state.hasUnresolvedConflict || state.status === 'conflict') {
+          return {
+            safe: false,
+            reason: `'${key}' 항목에 아직 해결되지 않은 충돌이 남아 있습니다. 충돌을 먼저 해결해 주세요.`,
+          };
+        }
+        if (state.needsRawBackup || (Array.isArray(state.pendingCorruptedRaws) && state.pendingCorruptedRaws.length > 0)) {
+          return {
+            safe: false,
+            reason: `'${key}' 항목에 아직 백업되지 않은 손상 원본 데이터가 남아 있습니다. 원본 백업을 먼저 완료해 주세요.`,
+          };
+        }
+        if (state.status === 'error') {
+          return {
+            safe: false,
+            reason: `'${key}' 항목에 저장되지 않은 오류 상태가 있습니다. 저장을 정상화한 후 가져오기를 실행해 주세요.`,
+          };
+        }
+      }
+    }
+
+    // 2. localStorage 디스크 직접 검사 (비활성 상태라도 손상 데이터가 디스크에 존재하는지 확인)
+    const baseKey = key.replace(/^tabpad_/, '');
+    const validator = validators[baseKey];
+    const diskCheck = inspectCurrentStorage(key, validator);
+    if (diskCheck.isCorrupted) {
+      return {
+        safe: false,
+        reason: `'${key}' 키의 현재 로컬 저장소 데이터가 손상되어 있습니다. 기존 데이터를 보호하기 위해 가져오기를 차단했습니다. 먼저 원본 복구 또는 백업을 완료해 주세요.`,
+      };
+    }
+  }
+
+  return { safe: true, reason: null };
+}
+
+/**
  * 손상된 원본 문자열을 백업 키에 안전하게 보존 시도하고 실제 읽기 검증까지 수행하여 반환
  */
 function tryBackupCorruptedRaw(key, raw) {
@@ -257,6 +336,14 @@ export function useLocalStorage(key, initialValue, options = {}) {
   useEffect(() => {
     isEditingRef.current = isEditing;
   }, [isEditing]);
+
+  // 외부(DataTransferModal 등)에서 안전성 점검을 수행할 수 있도록 레지스트리에 등록
+  useEffect(() => {
+    return registerHookInstance(key, {
+      getState: () => stateRef.current,
+      getIsEditing: () => isEditingRef.current,
+    });
+  }, [key]);
 
   // 실제 localStorage에 값을 기록하고 다시 읽어 저장 성공 여부를 검증하는 헬퍼
   const writeToStorage = useCallback(
@@ -601,7 +688,7 @@ export function useLocalStorage(key, initialValue, options = {}) {
   // 다중 탭 storage 이벤트 리스너 (외부 값 수신만으로는 절대 localStorage에 다시 쓰지 않음)
   useEffect(() => {
     const handleStorageChange = (e) => {
-      if (e.storageArea !== window.localStorage || e.key !== key) return;
+      if ((e.storageArea && e.storageArea !== window.localStorage) || e.key !== key) return;
       if (e.newValue === null) return;
 
       const current = stateRef.current;

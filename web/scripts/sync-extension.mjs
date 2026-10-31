@@ -92,3 +92,4 @@ function scanDirForForbidden(dir) {
 
 scanDirForForbidden(extDir);
 console.log('✓ 확장 산출물(/extension) 동기화 및 AdSense/원격 스크립트 0건 검증 완료');
+
