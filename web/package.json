@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build --mode web",
+    "build:web": "vite build --mode web",
+    "build:extension": "vite build --mode extension --outDir dist-extension && node scripts/sync-extension.mjs",
     "lint": "oxlint",
     "test": "node tests/useLocalStorage.react.test.mjs && node tests/verify_audit.mjs",
     "preview": "vite preview"

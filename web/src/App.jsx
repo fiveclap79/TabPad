@@ -1,3 +1,4 @@
+/* global __BUILD_TARGET__ */
 import React, { useEffect } from 'react';
 import { useLocalStorage, validators } from './hooks/useLocalStorage';
 import ThemeToggle from './components/ThemeToggle';
@@ -5,17 +6,27 @@ import TodoList from './components/TodoList';
 import Snippets from './components/Snippets';
 import MemoPad from './components/MemoPad';
 import AdSenseSlot from './components/AdSenseSlot';
+import DataTransferModal from './components/DataTransferModal';
+
+// 빌드 타임 상수(__BUILD_TARGET__)를 통해 웹 빌드와 확장 프로그램 빌드를 물리적으로 분리
+const IS_EXTENSION_BUILD =
+  typeof __BUILD_TARGET__ !== 'undefined' && __BUILD_TARGET__ === 'extension';
 
 /**
  * TabPad 메인 레이아웃 및 테마 프로바이더
  * - 테마 시스템: 'system'(시스템 기본값), 'light'(라이트 모드), 'dark'(다크 모드) 스키마 검증 포함
- * - 레이아웃: 좌측 사이드바 30%(투두/상용구) - 우측 메인 70%(메모장) + 하단 애드센스 슬롯
+ * - 레이아웃: 좌측 사이드바 30%(투두/상용구) - 우측 메인 70%(메모장)
+ * - 빌드 분리: 웹 버전('web')에서만 하단 AdSenseSlot을 렌더링하며,
+ *   확장 프로그램 버전('extension')에서는 AdSense 코드 및 컴포넌트를 번들에서 완전히 제외함
  */
 export default function App() {
-  const [theme, setTheme, { status: themeStatus, error: themeError, retrySave: retryThemeSave }] =
-    useLocalStorage('tabpad_theme', 'system', {
-      validate: validators.theme,
-    });
+  const [
+    theme,
+    setTheme,
+    { status: themeStatus, error: themeError, retrySave: retryThemeSave },
+  ] = useLocalStorage('tabpad_theme', 'system', {
+    validate: validators.theme,
+  });
 
   const safeTheme = validators.theme(theme) ? theme : 'system';
 
@@ -65,7 +76,7 @@ export default function App() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2.5">
           {themeStatus !== 'saved' && themeError && (
             <button
               type="button"
@@ -76,6 +87,8 @@ export default function App() {
               ⚠️ 테마 저장 재시도
             </button>
           )}
+          {/* 웹 <-> 확장 프로그램 간 수동 데이터 백업/이전 모달 버튼 */}
+          <DataTransferModal />
           {/* 테마 토글 버튼 (시스템 기본값 / 라이트 모드 / 다크 모드) */}
           <ThemeToggle theme={safeTheme} setTheme={setTheme} />
         </div>
@@ -99,10 +112,12 @@ export default function App() {
         </section>
       </main>
 
-      {/* 하단 구글 애드센스 슬롯 영역 (정책 검토 전까지 Placeholder 유지) */}
-      <footer className="px-6 pb-4 shrink-0">
-        <AdSenseSlot />
-      </footer>
+      {/* 웹 빌드에서만 구글 애드센스 슬롯 영역 노출 (확장 빌드에서는 트리쉐이킹으로 완전히 제거됨) */}
+      {!IS_EXTENSION_BUILD && (
+        <footer className="px-6 pb-4 shrink-0">
+          <AdSenseSlot />
+        </footer>
+      )}
     </div>
   );
 }

@@ -3,97 +3,70 @@
 ## 1. 프로젝트 개요
 
 * **프로젝트명:** TabPad
-* **목표:** 크롬 새 탭(New Tab)을 대체하는 생산성 대시보드 확장 프로그램. (구글 애드센스 수익 창출 목적)
-* **아키텍처 (하이브리드 구조):**
-  * 애드센스 정책 준수를 위해 메인 대시보드는 웹앱(Vercel 배포)으로 구축.
-  * 크롬 확장 프로그램은 사용자가 새 탭을 열 때 웹앱 URL로 **리다이렉트**만 수행하는 가벼운 래퍼(Wrapper)로 구성.
-* **타겟 환경:** `D:\프로젝트\TabPad` (로컬 디렉토리) -> Github 연동 -> Vercel 배포 / 크롬 웹스토어 등록
+* **목표:** 크롬 새 탭(New Tab)을 대체하는 생산성 대시보드 확장 프로그램 및 웹 대시보드.
+* **아키텍처 (웹·확장 분리 빌드 및 내장형 확장 구조):**
+  * **크롬 확장 프로그램 (`/extension`):** Chrome Web Store의 Minimum Functionality 정책 및 Manifest V3 보안 정책(`script-src 'self'`)을 준수하기 위해, 외부 URL 리다이렉트 대신 **확장 패키지 내부에서 React 생산성 대시보드(`index.html` + 로컬 정적 번들)를 직접 실행**한다. 확장 산출물에는 AdSense 코드와 외부 원격 실행 스크립트를 일절 포함하지 않는다.
+  * **웹앱 대시보드 (`/web` -> Vercel 배포):** 동일한 소스 코드에서 웹 전용 빌드(`--mode web`)로 배포하며, 하단 `AdSenseSlot` 영역을 포함한다 (AdSense 정책 검토 및 심사 승인 전까지는 Placeholder 유지).
+  * **데이터 저장 및 이전 정책:** 브라우저 동일 출처 정책(Same-Origin Policy)에 따라 웹 버전(`https://...`)과 확장 프로그램(`chrome-extension://...`)의 `localStorage`는 서로 분리되어 있으며 **자동으로 이전되지 않는다.** 사용자가 두 환경 간 데이터를 직접 이전할 수 있도록 상단 헤더에 **JSON 백업 내보내기 / 가져오기(`DataTransferModal.jsx`)** 기능을 제공한다.
+* **타겟 환경:** `D:\프로젝트\TabPad` (로컬 디렉토리) -> Github 연동 -> Vercel 배포 (`https://web-seven-wine-12.vercel.app`) / 크롬 확장 프로그램 패키징 (`tabpad-extension.zip`)
 * **할당 계정 (GitHub / Vercel):** `fiveclap79@gmail.com`
 
-## 2. AI 에이전트(Antigravity) 작업 및 CLI 자동화 지침
+## 2. 기술 스택 (Tech Stack)
 
-너(Antigravity)는 이 문서의 내용을 바탕으로 `D:\프로젝트\TabPad` 내에 필요한 모든 파일과 코드를 작성하고, **오너의 수동(GUI) 개입 없이 CLI를 통해 배포까지 완료**해야 한다.
-
-1. **CLI 기반 형상관리 및 배포 최우선:** 오너는 웹사이트에 들어가서 버튼을 누르지 않는다. 너는 내장 터미널에서 `git`, GitHub CLI(`gh`), Vercel CLI(`vercel`) 명령어를 직접 실행하여 권한 인증, 레포지토리 생성, 커밋/푸시, 프로젝트 생성 및 배포를 모두 처리하라.
-2. **권한 인증 처리:** CLI 로그인 과정(`gh auth login`, `vercel login`)에서 웹 브라우저 인증이나 토큰이 필요한 경우, 오너에게 터미널의 어떤 링크를 클릭해야 하는지 또는 어떤 토큰을 발급받아 입력해야 하는지 명확하게 가이드하고 입력을 대기하라.
-3. **폴더 분리:** 반드시 `/web` (React 웹앱)과 `/extension` (크롬 확장 프로그램) 폴더를 분리하여 생성하라.
-4. **더미 데이터 및 주석:** 코드는 즉시 실행 가능하도록 작성하며, 필요한 경우 직관적인 더미 데이터와 한글 주석을 포함하라.
-
-## 3. 기술 스택 (Tech Stack)
-
-* **프론트엔드 (웹앱):** React 18, Vite, TailwindCSS (디자인 및 다크모드 대응)
-* **상태/데이터 관리:** 브라우저 기본 `localStorage` (MVP 단계에서는 외부 DB 미사용)
-* **크롬 확장 프로그램:** Manifest V3 (바닐라 HTML/JS 기반)
+* **프론트엔드 (웹앱 & 내장형 확장 공통):** React 18 (`^18.3.1`), Vite, TailwindCSS (디자인 및 다크모드 대응)
+* **상태/데이터 관리:** 브라우저 `localStorage` (스키마 검증, 손상 원본 다중 백업 보존, 다중 탭 동기화 및 충돌 보호, JSON 수동 백업/복원 지원)
+* **크롬 확장 프로그램:** Manifest V3 (내장형 React 번들 직접 실행, `content_security_policy: "script-src 'self'; object-src 'self';"`, 원격 코드 0건)
 * **배포 및 인프라 도구:** GitHub CLI (`gh`), Vercel CLI (`vercel`)
 
-## 4. 디렉토리 구조 명세서
+## 3. 디렉토리 구조 명세서
 
 ```text
 D:\프로젝트\TabPad
-├── /web                  # Vercel 배포용 웹앱 (Vite + React)
+├── /web                              # 웹앱 및 확장 프로그램 통합 소스 (Vite + React 18)
 │   ├── index.html
-│   ├── vite.config.js
+│   ├── vite.config.js                # --mode web / --mode extension 빌드 분리 설정
 │   ├── tailwind.config.js
+│   ├── scripts/
+│   │   └── sync-extension.mjs        # 확장 빌드 산출물을 /extension에 동기화 및 금지 패턴 검증
+│   ├── tests/
+│   │   ├── useLocalStorage.react.test.mjs
+│   │   └── verify_audit.mjs
 │   ├── src/
-│   │   ├── App.jsx       # 메인 레이아웃 및 테마 프로바이더
-│   │   ├── components/   # 각 기능별 컴포넌트
+│   │   ├── App.jsx                   # 메인 레이아웃, 테마 프로바이더 및 빌드 타겟별 분기
+│   │   ├── components/
 │   │   │   ├── ThemeToggle.jsx
+│   │   │   ├── DataTransferModal.jsx # 웹 <-> 확장 간 JSON 백업 내보내기/가져오기
 │   │   │   ├── TodoList.jsx
 │   │   │   ├── Snippets.jsx
 │   │   │   ├── MemoPad.jsx
-│   │   │   └── AdSenseSlot.jsx
-│   │   ├── hooks/        
-│   │   │   └── useLocalStorage.js # 로컬 스토리지 동기화 커스텀 훅
-│   │   └── index.css     # Tailwind 지시어 포함
+│   │   │   └── AdSenseSlot.jsx       # 웹 빌드 전용 (확장 빌드에서는 트리쉐이킹 제거)
+│   │   ├── hooks/
+│   │   │   └── useLocalStorage.js    # 스키마 검증, 다중 탭 충돌 보호, 다중 손상 백업 훅
+│   │   └── index.css
 │   └── .gitignore
-└── /extension            # 크롬 웹스토어 제출용 패키지
-    ├── manifest.json
-    ├── newtab.html
-    ├── redirect.js
-    └── icons/            # 16, 48, 128 픽셀 임시 아이콘 (단색 정사각형)
+└── /extension                        # 크롬 확장 프로그램 내장형 패키지 (npm run build:extension 산출물)
+    ├── manifest.json                 # Manifest V3, newtab -> index.html, CSP script-src 'self'
+    ├── index.html                    # 확장 내장 대시보드 엔트리
+    ├── assets/                       # 로컬 번들링된 JS / CSS (AdSense 및 원격 코드 미포함)
+    └── icons/                        # 16, 48, 128 픽셀 아이콘
 ```
 
-## 5. 핵심 기능 요구사항 (MVP)
+## 4. 핵심 기능 요구사항 (MVP)
 
-### 5.1 공통 UI 및 테마 설정
-* **테마 시스템:** '시스템 기본값', '라이트 모드', '다크 모드' 지원. Tailwind `darkMode: 'class'` 속성과 `localStorage`를 활용하여 테마 토글 버튼(`ThemeToggle.jsx`) 구현.
+### 4.1 공통 UI, 테마 및 데이터 이전
+* **테마 시스템:** '시스템 기본값', '라이트 모드', '다크 모드' 지원 (`ThemeToggle.jsx`).
+* **데이터 백업/이전 (`DataTransferModal.jsx`):** 웹 버전과 확장 프로그램 간 `localStorage` 출처 분리에 대응하기 위해 JSON 파일 내보내기 및 스키마 검증 기반 JSON 가져오기 기능 제공.
 * **레이아웃:** 좌측 사이드바 30%(투두/상용구) - 우측 메인 70%(메모장) 형태.
 
-### 5.2 기능 1: 메모장 및 글자수 세기 (`MemoPad.jsx`)
-* 자유롭게 텍스트를 입력할 수 있는 넓은 `textarea`.
-* 입력 내용 변경 시 `localStorage` 자동 저장(Auto-save).
+### 4.2 기능 1: 메모장 및 글자수 세기 (`MemoPad.jsx`)
+* 입력 내용 변경 시 `localStorage` 자동 저장 및 저장 상태/오류/충돌 배지 표시.
 * 하단에 **공백 포함/제외 글자수** 실시간 표시.
 
-### 5.3 기능 2: 할 일 관리 (`TodoList.jsx`)
-* 체크박스 형태의 To-do 리스트 (추가, 완료(취소선), 삭제 기능).
-* `localStorage`에 JSON 형태로 저장.
+### 4.3 기능 2: 할 일 관리 (`TodoList.jsx`)
+* 체크박스 형태의 To-do 리스트 (추가, 완료(취소선), 삭제 기능, `localStorage` JSON 저장).
 
-### 5.4 기능 3: 상용구 클립보드 원클릭 복사 (`Snippets.jsx`)
-* 자주 쓰는 문구를 리스트로 관리.
-* 클릭 시 `navigator.clipboard.writeText()` 실행 및 "복사되었습니다!" 토스트 알림 2초간 표시.
+### 4.4 기능 3: 상용구 클립보드 원클릭 복사 (`Snippets.jsx`)
+* 클릭 시 `navigator.clipboard.writeText()` 실행 및 마지막 복사 시점부터 2초간 성공/실패 토스트 알림 표시.
 
-### 5.5 기능 4: 구글 애드센스 슬롯 (`AdSenseSlot.jsx`)
-* 하단에 구글 애드센스 배너가 노출될 `<div>` 컨테이너 배치.
-* "Google AdSense Slot" 텍스트가 적힌 Placeholder 박스로 퍼블리싱.
-
-## 6. 크롬 확장 프로그램 요구사항 (`/extension`)
-
-* **`manifest.json`:** Manifest V3 준수, `chrome_url_overrides`로 `newtab` 덮어쓰기.
-* **`newtab.html` & `redirect.js`:** 확장 프로그램 보안 정책(CSP) 준수를 위해 리다이렉트 로직 분리.
-* **리다이렉트:** `window.location.replace("https://[최종배포된-Vercel-URL]")` 실행. Vercel 배포 완료 후 터미널에 출력된 URL을 이 파일에 자동/수동으로 업데이트하라.
-
-## 7. Antigravity 실행 시나리오 (Action Items - 필수 준수)
-
-Antigravity는 아래 순서대로 터미널 명령어를 실행하여 프로젝트를 완성하라. 오너의 개입을 최소화한다.
-
-1. **로컬 프로젝트 스캐폴딩:** `/web`에 Vite(React+JS) 프로젝트 생성 및 TailwindCSS 설치, `/extension` 기본 파일 생성.
-2. **기능 구현:** React 컴포넌트(Todo, Memo, Snippet, Theme) 개발 및 `localStorage` 연동 로직 작성.
-3. **Git 초기화 및 GitHub 연동 (CLI):**
-   * 터미널에서 `git init`, `.gitignore` 세팅 후 로컬 커밋 수행.
-   * `gh auth login`을 실행하여 `fiveclap79@gmail.com` 계정으로 연동. (필요 시 오너에게 브라우저 인증 승인 요청)
-   * `gh repo create TabPad --public --source=. --remote=origin --push` 실행하여 원격 레포지토리 생성 및 코드 푸시.
-4. **Vercel 자동 배포 (CLI):**
-   * `npm i -g vercel` 로 Vercel CLI 설치.
-   * `/web` 디렉토리로 이동하여 `vercel login` 실행 (필요 시 오너에게 이메일(`fiveclap79@gmail.com`) 인증 링크 확인 요청).
-   * `vercel --prod --yes` 명령을 실행하여 프로젝트를 Vercel에 배포.
-5. **확장 프로그램 URL 업데이트:** Vercel 배포가 완료되어 Production URL이 출력되면, 해당 URL을 `/extension/redirect.js` 내부의 리다이렉트 주소로 업데이트하라.
+### 4.5 기능 4: 구글 애드센스 슬롯 (`AdSenseSlot.jsx` — 웹 빌드 전용)
+* 웹 빌드(`--mode web`)에서만 하단에 노출되며, 확장 빌드(`--mode extension`)에서는 번들에서 완전히 제외된다.
