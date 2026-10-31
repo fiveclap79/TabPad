@@ -52,6 +52,52 @@ const mimeTypes = {
 
 const webServer = http.createServer((req, res) => {
   const urlPath = req.url === '/' ? '/index.html' : req.url.split('?')[0];
+
+  // ★ 요구사항 3 준수: 수집기의 실시간 탐지 능력을 검증하기 위한 부정 검증용 엔드포인트
+  if (urlPath === '/negative-test.html') {
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy': "default-src 'self'; script-src 'self'; img-src 'self';",
+    });
+    res.end(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Negative CSP & Error Test</title>
+</head>
+<body>
+  <h1>수집기 검출 능력 부정 검증용 테스트 페이지</h1>
+  <script src="/negative-violator.js"></script>
+</body>
+</html>`);
+    return;
+  }
+
+  if (urlPath === '/negative-violator.js') {
+    res.writeHead(200, {
+      'Content-Type': 'application/javascript; charset=utf-8',
+    });
+    res.end(`
+// 1. eval 호출 시도: script-src 'self' 정책 위반 -> securitypolicyviolation 이벤트 발생
+try {
+  eval("window.__evalExecuted = 1;");
+} catch (e) {
+  // eval 차단 예외 발생
+}
+
+// 2. 비인가 외부 이미지 삽입: img-src 'self' 정책 위반 -> securitypolicyviolation 이벤트 발생
+const img = document.createElement('img');
+img.src = 'https://untrusted-external-domain.invalid/test.png';
+document.body.appendChild(img);
+
+// 3. 비동기 런타임 예외 발생: pageerror 및 console.error 트리거
+setTimeout(() => {
+  throw new Error('의도된 부정 검증 런타임 오류 (수집기 탐지 검증용)');
+}, 100);
+`);
+    return;
+  }
+
   const filePath = path.join(distWebDir, urlPath);
 
   if (!filePath.startsWith(distWebDir) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
@@ -72,63 +118,146 @@ const webPort = webServer.address().port;
 const localWebUrl = `http://127.0.0.1:${webPort}/index.html`;
 console.log(`웹 대시보드 로컬 서빙 시작: ${localWebUrl}`);
 
-// ★ 요구사항 3 준수: 모든 페이지와 모든 탐색의 CSP 위반 및 오류를 탐색 초기화 전에 수집하는 글로벌 누적 배열
+// ★ 요구사항 3 준수: 제품 검증 결과와 부정 검증의 예상 오류를 엄격히 분리하기 위한 모드 및 저장소
+let collectorMode = 'product'; // 'product' | 'negative_test'
+
+// 제품 검증 누적 저장소 (항상 0건이어야 함)
 const globalCspViolations = [];
 const globalConsoleErrors = [];
 const globalRuntimeErrors = [];
 
+// 부정 검증 누적 저장소 (의도적 오류 수집 확인용)
+const negativeCspViolations = [];
+const negativeConsoleErrors = [];
+const negativeRuntimeErrors = [];
+
+// 중복 등록 방지를 위한 WeakSet
+const attachedPages = new WeakSet();
+
 /**
- * 브라우저 인스턴스에 타겟 생성 전 리스너를 선제 등록하여
- * 초기 탭, 새 탭, 웹 페이지, 확장 페이지의 모든 탐색에서 CSP 위반을 누적 수집
+ * ★ 요구사항 1 & 2 준수: 기존 페이지와 새 페이지 모두에 공통 attachCollector(page) 적용
+ * CSP 이벤트 발생 즉시 Node 측 누적 저장소로 전달하며 수집 실패를 조용히 무시하지 않음
  */
-function setupPreNavigationCspCollector(browserInstance) {
+async function attachCollector(page) {
+  if (!page || attachedPages.has(page)) {
+    return;
+  }
+  attachedPages.add(page);
+
+  // 1. 콘솔 에러 리스너
+  page.on('console', (msg) => {
+    if (msg.type() === 'error' && !msg.text().includes('favicon')) {
+      const entry = {
+        url: page.url(),
+        text: msg.text(),
+        location: msg.location(),
+        timestamp: Date.now(),
+      };
+      if (collectorMode === 'negative_test') {
+        negativeConsoleErrors.push(entry);
+      } else {
+        globalConsoleErrors.push(entry);
+      }
+    }
+  });
+
+  // 2. 런타임 페이지 에러 리스너
+  page.on('pageerror', (err) => {
+    const entry = {
+      url: page.url(),
+      message: err.message,
+      stack: err.stack,
+      timestamp: Date.now(),
+    };
+    if (collectorMode === 'negative_test') {
+      negativeRuntimeErrors.push(entry);
+    } else {
+      globalRuntimeErrors.push(entry);
+    }
+  });
+
+  // 3. 브라우저 페이지 크래시 에러 리스너
+  page.on('error', (err) => {
+    const entry = {
+      url: page.url(),
+      message: `[Page Crash] ${err.message}`,
+      timestamp: Date.now(),
+    };
+    if (collectorMode === 'negative_test') {
+      negativeRuntimeErrors.push(entry);
+    } else {
+      globalRuntimeErrors.push(entry);
+    }
+  });
+
+  // 4. CSP 이벤트 발생 즉시 Node로 전달하는 바인딩 함수 등록 (수집 실패를 무시하지 않음)
+  try {
+    await page.exposeFunction('__tabpadReportCspViolation', (violation) => {
+      const entry = {
+        blockedURI: violation.blockedURI,
+        violatedDirective: violation.violatedDirective,
+        originalPolicy: violation.originalPolicy,
+        documentURI: violation.documentURI,
+        effectiveDirective: violation.effectiveDirective,
+        timestamp: Date.now(),
+      };
+      if (collectorMode === 'negative_test') {
+        negativeCspViolations.push(entry);
+      } else {
+        globalCspViolations.push(entry);
+      }
+    });
+  } catch (err) {
+    if (!err.message.includes('already exists')) {
+      console.error('CSP exposeFunction 등록 실패:', err);
+      throw new Error(`CSP exposeFunction 바인딩 실패: ${err.message}`);
+    }
+  }
+
+  // 5. evaluateOnNewDocument로 문서 파싱/스크립트 실행 전 securitypolicyviolation 리스너 주입
+  try {
+    await page.evaluateOnNewDocument(() => {
+      document.addEventListener('securitypolicyviolation', (e) => {
+        try {
+          if (typeof window.__tabpadReportCspViolation === 'function') {
+            window.__tabpadReportCspViolation({
+              blockedURI: e.blockedURI,
+              violatedDirective: e.violatedDirective,
+              originalPolicy: e.originalPolicy,
+              documentURI: document.documentURI,
+              effectiveDirective: e.effectiveDirective,
+            });
+          } else {
+            console.error('CSP 위반 전달 함수(__tabpadReportCspViolation)가 준비되지 않음');
+          }
+        } catch (dispatchErr) {
+          console.error('CSP 위반 Node 전달 중 예외 발생:', dispatchErr);
+        }
+      });
+    });
+  } catch (err) {
+    console.error('CSP evaluateOnNewDocument 등록 실패:', err);
+    throw new Error(`CSP evaluateOnNewDocument 주입 실패: ${err.message}`);
+  }
+}
+
+/**
+ * 브라우저 인스턴스에 새 타겟 생성 리스너 등록
+ */
+function setupBrowserAutoCollector(browserInstance) {
   browserInstance.on('targetcreated', async (target) => {
     if (target.type() === 'page') {
       try {
         const page = await target.page();
         if (page) {
-          page.on('console', (msg) => {
-            if (msg.type() === 'error' && !msg.text().includes('favicon')) {
-              globalConsoleErrors.push({ url: page.url(), text: msg.text() });
-            }
-          });
-          page.on('pageerror', (err) => {
-            globalRuntimeErrors.push({ url: page.url(), message: err.message });
-          });
-          // 새 문서 로드 전에 securitypolicyviolation 리스너 주입
-          await page.evaluateOnNewDocument(() => {
-            if (!window.__tabpadCspLog) {
-              window.__tabpadCspLog = [];
-              document.addEventListener('securitypolicyviolation', (e) => {
-                window.__tabpadCspLog.push({
-                  blockedURI: e.blockedURI,
-                  violatedDirective: e.violatedDirective,
-                  originalPolicy: e.originalPolicy,
-                  documentURI: document.documentURI,
-                });
-              });
-            }
-          });
+          await attachCollector(page);
         }
-      } catch {
-        // 이미 닫힌 타겟 무시
+      } catch (err) {
+        console.error('새 타겟 attachCollector 처리 실패:', err);
+        throw err;
       }
     }
   });
-}
-
-/**
- * 페이지에서 누적된 CSP 위반 로그를 글로벌 배열로 동기화
- */
-async function syncPageCspLog(page) {
-  try {
-    const logs = await page.evaluate(() => window.__tabpadCspLog || []);
-    for (const log of logs) {
-      globalCspViolations.push(log);
-    }
-  } catch {
-    // ignore
-  }
 }
 
 let browser1 = null;
@@ -155,11 +284,69 @@ try {
     ],
   });
 
-  // ★ 요구사항 3 준수: 어떤 페이지도 로드되기 전 브라우저 레벨에서 선제 CSP/에러 리스너 등록
-  setupPreNavigationCspCollector(browser1);
+  // ★ 요구사항 1 준수: 기존 페이지와 새 페이지 모두에 공통 attachCollector(page)를 적용
+  setupBrowserAutoCollector(browser1);
+  const initialPages1 = await browser1.pages();
+  for (const p of initialPages1) {
+    await attachCollector(p);
+  }
+
+  // =========================================================================
+  // ★ 요구사항 3 준수: [부정 검증] 의도적 CSP 위반과 런타임 오류 검출 능력 실환경 검증
+  // =========================================================================
+  console.log('\n--- [부정 검증] 테스트 페이지에서 의도적 CSP 위반 및 런타임 오류 실시간 검출 검증 ---');
+  collectorMode = 'negative_test';
+
+  const negativeTestPage = await browser1.newPage();
+  await attachCollector(negativeTestPage); // 등록 완료 대기 후 탐색
+
+  const negativeTestUrl = `http://127.0.0.1:${webPort}/negative-test.html`;
+  console.log(`부정 검증 테스트 페이지 탐색 시작: ${negativeTestUrl}`);
+  await negativeTestPage.goto(negativeTestUrl, { waitUntil: 'networkidle0', timeout: 15000 });
+
+  // 비동기 런타임 예외 및 CSP 이벤트 실시간 수집 대기 (최대 3초)
+  const negWaitStart = Date.now();
+  while (Date.now() - negWaitStart < 3000) {
+    if (negativeCspViolations.length >= 1 && negativeRuntimeErrors.length >= 1) {
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  console.log('부정 검증 즉시 수집 결과:', {
+    cspViolationsCount: negativeCspViolations.length,
+    runtimeErrorsCount: negativeRuntimeErrors.length,
+    consoleErrorsCount: negativeConsoleErrors.length,
+    sampleCspDirective: negativeCspViolations[0]?.violatedDirective,
+    sampleRuntimeMessage: negativeRuntimeErrors[0]?.message,
+  });
+
+  assert.ok(
+    negativeCspViolations.length >= 1,
+    `부정 검증에서 CSP 위반 이벤트가 즉시 1건 이상 감지되어야 함 (실제: ${negativeCspViolations.length}건)`
+  );
+  assert.ok(
+    negativeRuntimeErrors.length >= 1,
+    `부정 검증에서 의도적 런타임 예외가 즉시 1건 이상 감지되어야 함 (실제: ${negativeRuntimeErrors.length}건)`
+  );
+  assert.ok(
+    negativeRuntimeErrors.some((e) => e.message.includes('의도된 부정 검증 런타임 오류')),
+    '의도된 부정 검증 런타임 오류 메시지가 정확히 포착되어야 함'
+  );
+
+  // 페이지 닫기 후에도 Node 저장소에 기록 유지 검증 (요구사항 2 확인)
+  await negativeTestPage.close();
+  assert.ok(
+    negativeCspViolations.length >= 1,
+    '페이지 종료 후에도 Node 측 누적 저장소에 CSP 위반 기록이 온전히 유지되어야 함'
+  );
+  console.log('✓ [부정 검증 통과] 수집기가 의도적 CSP 위반과 런타임 오류를 즉시 검출함을 확인 완료 (페이지 종료 후에도 보존 확인)');
+
+  // 제품 검증 모드로 복귀 (부정 검증의 예상 오류와 제품 검증 결과를 완벽히 분리)
+  collectorMode = 'product';
 
   // ★ 요구사항 준수: Google 공식 Puppeteer 확장 설치 API(browser.installExtension)를 사용하여 확장을 공식 설치하고 브라우저가 부여한 실제 확장 ID 획득!
-  console.log(`확장 설치 시도 경로: ${asciiExtDir}`);
+  console.log(`\n확장 설치 시도 경로: ${asciiExtDir}`);
   const extensionId = await browser1.installExtension(asciiExtDir);
   console.log(`✓ Google 공식 Puppeteer installExtension 성공! 브라우저가 부여한 실제 확장 ID: ${extensionId}`);
   assert.ok(extensionId && typeof extensionId === 'string' && extensionId.length === 32, '유효한 32자리 확장 ID가 반환되어야 함');
@@ -169,6 +356,7 @@ try {
 
   const pages1 = await browser1.pages();
   const page1 = pages1.length > 0 ? pages1[0] : await browser1.newPage();
+  await attachCollector(page1); // 등록 완료 대기 후 탐색
 
   // 실제 설치된 chrome-extension://<id>/index.html 탐색
   const extensionPageUrl = `chrome-extension://${extensionId}/index.html`;
@@ -182,6 +370,7 @@ try {
   // ★ 요구사항 1 준수: 새 탭(chrome://newtab)의 실제 URL과 대시보드 렌더링을 직접 assert
   console.log('\n--- [새 탭 오버라이드 및 렌더링 엄격 검증] ---');
   const newTabPage = await browser1.newPage();
+  await attachCollector(newTabPage); // 등록 완료 대기 후 탐색
   await newTabPage.goto('chrome://newtab', { waitUntil: 'networkidle0', timeout: 15000 });
 
   const newTabActualUrl = newTabPage.url();
@@ -210,7 +399,6 @@ try {
   assert.equal(newTabRendered.hasQuickMemo, true, '새 탭 페이지에 빠른 메모 섹션이 렌더링되어야 함');
   console.log('✓ 새 탭(chrome://newtab) 실제 URL 일치 및 대시보드 전체 렌더링 assert 통과');
 
-  await syncPageCspLog(newTabPage);
   await newTabPage.close();
 
   // 대시보드 메인 페이지 렌더링 확인
@@ -308,8 +496,6 @@ try {
   assert.equal(reloadedData.isDarkClass, true, '새로고침 후 다크 모드가 유지되어야 함');
   console.log('✓ 새로고침 후 실제 네이티브 localStorage 및 UI 완전 유지 확인');
 
-  await syncPageCspLog(page1);
-
   // 브라우저 1차 종료
   await browser1.close();
   browser1 = null;
@@ -336,8 +522,12 @@ try {
     ],
   });
 
-  // ★ 요구사항 3 준수: 재시작 브라우저에서도 어떤 페이지도 로드되기 전 선제 CSP/에러 리스너 등록
-  setupPreNavigationCspCollector(browser2);
+  // ★ 요구사항 1 준수: 재시작 브라우저에서도 기존 페이지 및 새 페이지에 공통 attachCollector 등록
+  setupBrowserAutoCollector(browser2);
+  const initialPages2 = await browser2.pages();
+  for (const p of initialPages2) {
+    await attachCollector(p);
+  }
 
   const extensionId2 = await browser2.installExtension(asciiExtDir);
   console.log(`재시작 후 설치 확인된 확장 ID: ${extensionId2}`);
@@ -347,6 +537,7 @@ try {
 
   const pages2 = await browser2.pages();
   const page2 = pages2.length > 0 ? pages2[0] : await browser2.newPage();
+  await attachCollector(page2); // 등록 완료 대기 후 탐색
 
   // 재시작 후 확장 페이지 열기
   await page2.goto(extensionPageUrl, { waitUntil: 'networkidle0', timeout: 15000 });
@@ -379,6 +570,7 @@ try {
 
   // 5-1. 웹 대시보드 페이지 열기
   const webPage = await browser2.newPage();
+  await attachCollector(webPage); // 등록 완료 대기 후 탐색
 
   // 브라우저 다운로드 경로를 downloadDir로 지정
   const cdpWebSession = await webPage.target().createCDPSession();
@@ -459,7 +651,6 @@ try {
   assert.equal(downloadedContent.app, 'TabPad');
   assert.equal(downloadedContent.data.tabpad_memo, '웹 UI에서 사용자가 직접 작성하여 내보낸 핵심 업무 메모');
 
-  await syncPageCspLog(webPage);
   await webPage.close();
 
   // 5-5. 확장 프로그램 페이지로 이동하여 웹 UI에서 다운로드한 백업 파일을 실제로 가져오기
@@ -517,21 +708,27 @@ try {
 
   console.log('✓ 웹 UI 다운로드 → 확장 프로그램 가져오기 전체 E2E 흐름 완벽 검증 통과');
 
-  await syncPageCspLog(page2);
-
   // =========================================================================
-  // 6단계: ★ 요구사항 3 준수: 모든 페이지와 모든 탐색의 CSP 보안 정책 위반 및 오류 누적 최종 판정
+  // 6단계: ★ 요구사항 3 준수: 부정 검증 결과와 제품 검증 결과 분리 최종 판정
   // =========================================================================
-  console.log('\n--- [6단계] 모든 페이지 및 탐색의 CSP 누적 위반 및 런타임 오류 최종 판정 ---');
+  console.log('\n--- [6단계] 부정 검증 결과와 제품 검증 결과 분리 및 최종 무결성 판정 ---');
 
-  console.log(`누적 수집된 CSP 위반 건수: ${globalCspViolations.length}건`);
-  console.log(`누적 수집된 콘솔 에러 건수: ${globalConsoleErrors.length}건`);
-  console.log(`누적 수집된 런타임 예외 건수: ${globalRuntimeErrors.length}건`);
+  console.log('▶ [부정 검증(Negative Test) 검출 내역 요약] (수집기 동작 입증용 예상 오류):');
+  console.log(`  - 포착된 CSP 위반: ${negativeCspViolations.length}건 (지침: ${negativeCspViolations.map((v) => v.violatedDirective).join(', ')})`);
+  console.log(`  - 포착된 런타임 예외: ${negativeRuntimeErrors.length}건 (메시지: ${negativeRuntimeErrors.map((e) => e.message).join(' | ')})`);
+  console.log(`  - 포착된 콘솔 에러: ${negativeConsoleErrors.length}건`);
+  assert.ok(negativeCspViolations.length >= 1, '부정 검증에서 CSP 위반이 1건 이상 감지되었음이 보장되어야 함');
+  assert.ok(negativeRuntimeErrors.length >= 1, '부정 검증에서 런타임 예외가 1건 이상 감지되었음이 보장되어야 함');
+
+  console.log('\n▶ [제품 검증(Product Verification) 누적 결과 요약] (제품 내 무결성 보장):');
+  console.log(`  - 누적 CSP 위반: ${globalCspViolations.length}건`);
+  console.log(`  - 누적 콘솔 에러: ${globalConsoleErrors.length}건`);
+  console.log(`  - 누적 런타임 예외: ${globalRuntimeErrors.length}건`);
 
   assert.equal(
     globalCspViolations.length,
     0,
-    `초기 탭, 새 탭 오버라이드, 웹 대시보드, 확장 페이지, 브라우저 재시작을 포함한 모든 탐색에서 CSP 위반이 0건이어야 함 (발생: ${JSON.stringify(globalCspViolations)})`
+    `초기 탭, 새 탭 오버라이드, 웹 대시보드, 확장 페이지, 브라우저 재시작을 포함한 모든 탐색에서 제품의 CSP 위반이 0건이어야 함 (발생: ${JSON.stringify(globalCspViolations)})`
   );
 
   const hasAdSense = await page2.evaluate(() => {
@@ -545,16 +742,16 @@ try {
 
   assert.equal(hasAdSense, false, '확장 프로그램 내에는 AdSense 관련 UI나 코드가 절대 존재하지 않아야 함');
   assert.equal(remoteScripts.length, 0, '확장 프로그램 내에는 외부 원격 스크립트가 0건이어야 함');
-  assert.equal(globalRuntimeErrors.length, 0, `모든 탐색에서 런타임 오류가 0건이어야 함 (발생: ${JSON.stringify(globalRuntimeErrors)})`);
-  assert.equal(globalConsoleErrors.length, 0, `모든 탐색에서 콘솔 에러가 0건이어야 함 (발생: ${JSON.stringify(globalConsoleErrors)})`);
+  assert.equal(globalRuntimeErrors.length, 0, `모든 제품 탐색에서 런타임 오류가 0건이어야 함 (발생: ${JSON.stringify(globalRuntimeErrors)})`);
+  assert.equal(globalConsoleErrors.length, 0, `모든 제품 탐색에서 콘솔 에러가 0건이어야 함 (발생: ${JSON.stringify(globalConsoleErrors)})`);
 
-  console.log('✓ 전 과정 CSP 위반 0건, 런타임 오류 0건, 콘솔 에러 0건, AdSense/원격스크립트 0건 최종 확인 완료');
+  console.log('✓ 제품 전 과정 CSP 위반 0건, 런타임 오류 0건, 콘솔 에러 0건, AdSense/원격스크립트 0건 최종 확인 완료');
 
   await browser2.close();
   browser2 = null;
 
   console.log('\n=========================================================================');
-  console.log('★ [검증 완료] 새 탭 오버라이드 assert, 웹 UI 다운로드→가져오기, 전과정 CSP 누적 판정 100% 통과!');
+  console.log('★ [검증 완료] 공통 attachCollector, 즉시 Node 전달, 부정/제품 검증 분리 E2E 100% 통과!');
   console.log('=========================================================================');
 } finally {
   if (browser1) {
