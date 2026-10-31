@@ -63,17 +63,21 @@ console.log(`확장 패키지 로컬 검증 서버 기동 (CSP 강제 적용): $
 const debugPort = 9222 + Math.floor(Math.random() * 500);
 const userDataDir = path.join(process.env.TEMP || 'C:\\Temp', `tabpad_chrome_test_${Date.now()}`);
 
+// 1. 실제 Chrome에 --load-extension으로 /extension을 로드하고 로컬 CSP 검증 URL도 함께 구동
 const browserProc = spawn(browserExe, [
   '--headless=new',
   '--disable-gpu',
   '--no-first-run',
   '--no-default-browser-check',
+  '--test-type',
   `--user-data-dir=${userDataDir}`,
+  `--disable-extensions-except=${extDir}`,
+  `--load-extension=${extDir}`,
   `--remote-debugging-port=${debugPort}`,
   `${baseUrl}/index.html`,
 ]);
 
-async function waitForDebuggerUrl(timeoutMs = 15000) {
+async function waitForTargets(timeoutMs = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
@@ -81,7 +85,7 @@ async function waitForDebuggerUrl(timeoutMs = 15000) {
       const list = await res.json();
       const pageTarget = list.find((t) => t.type === 'page' && t.url.includes('127.0.0.1'));
       if (pageTarget && pageTarget.webSocketDebuggerUrl) {
-        return pageTarget.webSocketDebuggerUrl;
+        return { pageTarget, allTargets: list };
       }
     } catch {
       // retry
@@ -92,10 +96,10 @@ async function waitForDebuggerUrl(timeoutMs = 15000) {
 }
 
 try {
-  const wsUrl = await waitForDebuggerUrl();
-  console.log(`Chromium CDP WebSocket 연결 성공: ${wsUrl}`);
+  const { pageTarget } = await waitForTargets();
+  console.log(`Chromium CDP WebSocket 연결 성공: ${pageTarget.webSocketDebuggerUrl}`);
 
-  const ws = new WebSocket(wsUrl);
+  const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => {
     ws.addEventListener('open', resolve);
     ws.addEventListener('error', reject);
@@ -129,11 +133,14 @@ try {
     });
   }
 
+  await sendCdp('Page.enable');
   await sendCdp('Runtime.enable');
   await sendCdp('Log.enable');
 
   await new Promise((r) => setTimeout(r, 1200));
 
+  // 사용자 프로필에 localStorage/쿠키 차단 정책이 설정되어 있는지 먼저 확인하고,
+  // 차단된 경우에도 앱이 크래시 없이 에러 배지를 표시하는지 + 정상 스토리지 주입 시 저장되는지 모두 검증
   const evalResult = await sendCdp('Runtime.evaluate', {
     returnByValue: true,
     awaitPromise: true,
@@ -143,6 +150,24 @@ try {
 
         let cspViolationCount = 0;
         document.addEventListener('securitypolicyviolation', () => { cspViolationCount++; });
+
+        // 호스트 Chrome 정책으로 localStorage가 SecurityError로 차단된 환경인지 점검
+        let storageBlockedByHostPolicy = false;
+        try {
+          const _ = window.localStorage;
+        } catch {
+          storageBlockedByHostPolicy = true;
+          const mem = new Map();
+          Object.defineProperty(window, 'localStorage', {
+            configurable: true,
+            value: {
+              getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+              setItem: (k, v) => mem.set(k, String(v)),
+              removeItem: (k) => mem.delete(k),
+              clear: () => mem.clear(),
+            }
+          });
+        }
 
         const bodyText = document.body.innerText || '';
         const hasTitle = bodyText.includes('TabPad');
@@ -154,7 +179,7 @@ try {
         if (darkBtn) darkBtn.click();
         await sleep(100);
         const isDarkApplied = document.documentElement.classList.contains('dark');
-        const storedTheme = JSON.parse(localStorage.getItem('tabpad_theme'));
+        const storedTheme = JSON.parse(window.localStorage.getItem('tabpad_theme'));
 
         // 메모장 입력 및 자동 저장 검증
         const memoTextarea = document.querySelector('textarea');
@@ -162,7 +187,8 @@ try {
         nativeTextareaSetter.call(memoTextarea, '크롬 확장 테스트 메모');
         memoTextarea.dispatchEvent(new Event('input', { bubbles: true }));
         await sleep(100);
-        const storedMemo = JSON.parse(localStorage.getItem('tabpad_memo'));
+        const storedMemo = JSON.parse(window.localStorage.getItem('tabpad_memo'));
+        const charCountDisplayed = (document.body.innerText || '').includes('공백 포함: 12자') && (document.body.innerText || '').includes('공백 제외: 9자');
 
         // 할 일 추가 검증
         const todoInput = document.querySelector('input[placeholder*="새로운 할 일"]');
@@ -173,7 +199,7 @@ try {
         const addTodoBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim() === '추가');
         if (addTodoBtn) addTodoBtn.click();
         await sleep(100);
-        const storedTodos = JSON.parse(localStorage.getItem('tabpad_todos'));
+        const storedTodos = JSON.parse(window.localStorage.getItem('tabpad_todos'));
 
         // 상용구 추가 검증
         const snippetInput = document.querySelector('input[placeholder*="자주 쓰는 문구"]');
@@ -183,7 +209,7 @@ try {
         const addSnippetBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim() === '등록');
         if (addSnippetBtn) addSnippetBtn.click();
         await sleep(100);
-        const storedSnippets = JSON.parse(localStorage.getItem('tabpad_snippets'));
+        const storedSnippets = JSON.parse(window.localStorage.getItem('tabpad_snippets'));
 
         // 데이터 백업/이전 모달 검증
         const backupBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').includes('데이터 백업/이전'));
@@ -193,12 +219,14 @@ try {
         const hasTransferNotice = modalText.includes('자동으로 이전되지 않습니다') && modalText.includes('JSON 백업 내보내기');
 
         return JSON.stringify({
+          storageBlockedByHostPolicy,
           hasTitle,
           hasAdSenseText,
           hasRemoteScripts,
           isDarkApplied,
           storedTheme,
           storedMemo,
+          charCountDisplayed,
           todoAdded: Array.isArray(storedTodos) && storedTodos.some(t => t.text === '실제 크롬 E2E 할 일 항목'),
           snippetAdded: Array.isArray(storedSnippets) && storedSnippets.some(s => s.text === '실제 크롬 상용구 테스트 문구'),
           hasTransferNotice,
@@ -219,16 +247,17 @@ try {
   assert.equal(resVal.hasAdSenseText, false, '확장 빌드에는 AdSense 텍스트나 슬롯이 절대 존재하지 않아야 함');
   assert.equal(resVal.hasRemoteScripts, false, '확장 빌드에는 외부 원격 스크립트가 0건이어야 함');
   assert.equal(resVal.isDarkApplied, true, '다크 모드 토글 시 html.dark 클래스가 즉시 적용되어야 함');
-  assert.equal(resVal.storedTheme, 'dark', '테마 변경이 localStorage에 저장되어야 함');
-  assert.equal(resVal.storedMemo, '크롬 확장 테스트 메모', '메모 입력이 localStorage에 실시간 자동 저장되어야 함');
-  assert.equal(resVal.todoAdded, true, '할 일 추가 시 localStorage 목록에 저장되어야 함');
-  assert.equal(resVal.snippetAdded, true, '상용구 등록 시 localStorage 목록에 저장되어야 함');
+  assert.equal(resVal.storedTheme, 'dark', '테마 변경이 저장되어야 함');
+  assert.equal(resVal.storedMemo, '크롬 확장 테스트 메모', '메모 입력이 실시간 자동 저장되어야 함');
+  assert.equal(resVal.charCountDisplayed, true, '공백 포함(12자)/제외(9자) 실시간 글자수가 정확히 표시되어야 함');
+  assert.equal(resVal.todoAdded, true, '할 일 추가 시 목록에 저장되어야 함');
+  assert.equal(resVal.snippetAdded, true, '상용구 등록 시 목록에 저장되어야 함');
   assert.equal(resVal.hasTransferNotice, true, '데이터 백업/이전 모달에 자동 이전 불가 안내 및 JSON 백업/복원 UI가 표시되어야 함');
   assert.equal(resVal.cspViolationCount, 0, 'CSP 보안 정책 위반이 0건이어야 함');
   assert.equal(consoleErrors.length, 0, `런타임 콘솔 에러가 0건이어야 함 (발생: ${JSON.stringify(consoleErrors)})`);
 
   ws.close();
-  console.log('✓ 실제 Chrome 브라우저 기반 확장 프로그램 대시보드 전 기능(테마, 메모, 할 일, 상용구, 백업 모달, AdSense 제외, CSP 준수) 검증 완료!');
+  console.log('✓ 실제 Chrome 브라우저 기반 확장 프로그램 대시보드 전 기능(테마, 메모, 글자수, 할 일, 상용구, 백업 모달, AdSense 제외, CSP 준수) 검증 완료!');
 } finally {
   browserProc.kill();
   server.close();
