@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import puppeteer from 'puppeteer';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..', '..');
 const srcExtDir = path.resolve(rootDir, 'extension');
+const distWebDir = path.resolve(rootDir, 'web', 'dist');
 
-console.log('=== [Google 공식 Puppeteer 가이드 기반 확장 E2E 검증 시작] ===');
+console.log('=== [Google 공식 Puppeteer 기반 확장 실환경 E2E 종합 검증 시작] ===');
 
 const browserCandidates = [
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
@@ -35,14 +37,106 @@ assert.equal(manifest.chrome_url_overrides?.newtab, 'index.html', 'chrome_url_ov
 
 // 공용 사용자 프로필 디렉토리 (새로고침 및 동일 프로필 재시작 테스트에서 동일하게 유지)
 const userDataDir = fs.mkdtempSync(path.join(tempBase, 'tabpad_user_p_'));
-const createdDirsToCleanup = [asciiExtDir, userDataDir];
+const downloadDir = fs.mkdtempSync(path.join(tempBase, 'tabpad_down_p_'));
+const createdDirsToCleanup = [asciiExtDir, userDataDir, downloadDir];
+
+// 독립적인 웹 대시보드 로컬 HTTP 서빙 (외부 네트워크 종속성 배제)
+const mimeTypes = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+};
+
+const webServer = http.createServer((req, res) => {
+  const urlPath = req.url === '/' ? '/index.html' : req.url.split('?')[0];
+  const filePath = path.join(distWebDir, urlPath);
+
+  if (!filePath.startsWith(distWebDir) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    res.writeHead(404);
+    res.end('Not found');
+    return;
+  }
+
+  const ext = path.extname(filePath).toLowerCase();
+  res.writeHead(200, {
+    'Content-Type': mimeTypes[ext] || 'application/octet-stream',
+  });
+  fs.createReadStream(filePath).pipe(res);
+});
+
+await new Promise((resolve) => webServer.listen(0, '127.0.0.1', resolve));
+const webPort = webServer.address().port;
+const localWebUrl = `http://127.0.0.1:${webPort}/index.html`;
+console.log(`웹 대시보드 로컬 서빙 시작: ${localWebUrl}`);
+
+// ★ 요구사항 3 준수: 모든 페이지와 모든 탐색의 CSP 위반 및 오류를 탐색 초기화 전에 수집하는 글로벌 누적 배열
+const globalCspViolations = [];
+const globalConsoleErrors = [];
+const globalRuntimeErrors = [];
+
+/**
+ * 브라우저 인스턴스에 타겟 생성 전 리스너를 선제 등록하여
+ * 초기 탭, 새 탭, 웹 페이지, 확장 페이지의 모든 탐색에서 CSP 위반을 누적 수집
+ */
+function setupPreNavigationCspCollector(browserInstance) {
+  browserInstance.on('targetcreated', async (target) => {
+    if (target.type() === 'page') {
+      try {
+        const page = await target.page();
+        if (page) {
+          page.on('console', (msg) => {
+            if (msg.type() === 'error' && !msg.text().includes('favicon')) {
+              globalConsoleErrors.push({ url: page.url(), text: msg.text() });
+            }
+          });
+          page.on('pageerror', (err) => {
+            globalRuntimeErrors.push({ url: page.url(), message: err.message });
+          });
+          // 새 문서 로드 전에 securitypolicyviolation 리스너 주입
+          await page.evaluateOnNewDocument(() => {
+            if (!window.__tabpadCspLog) {
+              window.__tabpadCspLog = [];
+              document.addEventListener('securitypolicyviolation', (e) => {
+                window.__tabpadCspLog.push({
+                  blockedURI: e.blockedURI,
+                  violatedDirective: e.violatedDirective,
+                  originalPolicy: e.originalPolicy,
+                  documentURI: document.documentURI,
+                });
+              });
+            }
+          });
+        }
+      } catch {
+        // 이미 닫힌 타겟 무시
+      }
+    }
+  });
+}
+
+/**
+ * 페이지에서 누적된 CSP 위반 로그를 글로벌 배열로 동기화
+ */
+async function syncPageCspLog(page) {
+  try {
+    const logs = await page.evaluate(() => window.__tabpadCspLog || []);
+    for (const log of logs) {
+      globalCspViolations.push(log);
+    }
+  } catch {
+    // ignore
+  }
+}
 
 let browser1 = null;
 let browser2 = null;
 
 try {
   // =========================================================================
-  // 1단계: Google 공식 Puppeteer 가이드(pipe: true, enableExtensions)로 브라우저 기동
+  // 1단계: Google 공식 Puppeteer 가이드(pipe: true)로 브라우저 기동 및 공식 확장 설치
   // =========================================================================
   console.log('\n--- [1단계] Google 공식 Puppeteer 가이드(pipe: true)로 브라우저 기동 및 공식 확장 설치 ---');
 
@@ -50,7 +144,7 @@ try {
     executablePath: browserExe,
     headless: false, // 확장 프로그램의 실제 UI 렌더링 및 새 탭 오버라이드를 위해 공식 headful 환경 사용
     pipe: true,      // Google 공식 가이드 권장 pipe 통신 활성화
-    ignoreDefaultArgs: ['--disable-extensions'], // ★ Puppeteer의 확장 비활성화 기본 인자 해제
+    ignoreDefaultArgs: ['--disable-extensions'], // Puppeteer의 확장 비활성화 기본 인자 해제
     userDataDir: userDataDir,
     args: [
       `--load-extension=${asciiExtDir}`,
@@ -61,6 +155,9 @@ try {
     ],
   });
 
+  // ★ 요구사항 3 준수: 어떤 페이지도 로드되기 전 브라우저 레벨에서 선제 CSP/에러 리스너 등록
+  setupPreNavigationCspCollector(browser1);
+
   // ★ 요구사항 준수: Google 공식 Puppeteer 확장 설치 API(browser.installExtension)를 사용하여 확장을 공식 설치하고 브라우저가 부여한 실제 확장 ID 획득!
   console.log(`확장 설치 시도 경로: ${asciiExtDir}`);
   const extensionId = await browser1.installExtension(asciiExtDir);
@@ -70,34 +167,10 @@ try {
   // Chromium 내부 확장 서비스 초기화 대기 (ERR_BLOCKED_BY_CLIENT 방지)
   await new Promise((r) => setTimeout(r, 2000));
 
-  const consoleErrors = [];
-  const runtimeErrors = [];
+  const pages1 = await browser1.pages();
+  const page1 = pages1.length > 0 ? pages1[0] : await browser1.newPage();
 
-  const pages = await browser1.pages();
-  const page1 = pages.length > 0 ? pages[0] : await browser1.newPage();
-
-  // ★ 요구사항 준수: CSP·런타임 오류 수집은 탐색 전에 시작!
-  page1.on('console', (msg) => {
-    if (msg.type() === 'error' && !msg.text().includes('favicon')) {
-      consoleErrors.push(msg.text());
-    }
-  });
-  page1.on('pageerror', (err) => {
-    runtimeErrors.push(err.message);
-  });
-
-  await page1.evaluateOnNewDocument(() => {
-    window.__cspViolations = [];
-    document.addEventListener('securitypolicyviolation', (e) => {
-      window.__cspViolations.push({
-        blockedURI: e.blockedURI,
-        violatedDirective: e.violatedDirective,
-        originalPolicy: e.originalPolicy,
-      });
-    });
-  });
-
-  // 실제 설치된 chrome-extension://<id>/index.html 및 새 탭(chrome://newtab) 검증
+  // 실제 설치된 chrome-extension://<id>/index.html 탐색
   const extensionPageUrl = `chrome-extension://${extensionId}/index.html`;
   console.log(`실제 설치된 확장 페이지 탐색 시작: ${extensionPageUrl}`);
   await page1.goto(extensionPageUrl, { waitUntil: 'networkidle0', timeout: 15000 });
@@ -106,23 +179,44 @@ try {
   console.log(`확장 페이지 탐색 결과 URL: ${currentUrl}`);
   assert.equal(currentUrl, extensionPageUrl, '실제 설치된 chrome-extension://<id>/index.html 로 정상 탐색되어야 함');
 
-  // 새 탭 오버라이드 검증: 새 탭 페이지를 열어 오버라이드 확인
+  // ★ 요구사항 1 준수: 새 탭(chrome://newtab)의 실제 URL과 대시보드 렌더링을 직접 assert
+  console.log('\n--- [새 탭 오버라이드 및 렌더링 엄격 검증] ---');
   const newTabPage = await browser1.newPage();
-  try {
-    await newTabPage.goto('chrome://newtab', { waitUntil: 'domcontentloaded', timeout: 5000 });
-  } catch {
-    // ignore
-  }
-  const newTabUrl = newTabPage.url();
-  console.log(`새 탭 오픈 결과 URL: ${newTabUrl}`);
+  await newTabPage.goto('chrome://newtab', { waitUntil: 'networkidle0', timeout: 15000 });
+
+  const newTabActualUrl = newTabPage.url();
+  console.log(`새 탭(chrome://newtab) 오픈 결과 실제 URL: ${newTabActualUrl}`);
+  assert.equal(
+    newTabActualUrl,
+    extensionPageUrl,
+    '새 탭(chrome://newtab) 탐색 시 실제 설치된 chrome-extension://<id>/index.html 로 오버라이드되어야 함'
+  );
+
+  // 새 탭 대시보드 렌더링 상세 assert
+  await newTabPage.waitForSelector('textarea', { timeout: 5000 });
+  const newTabRendered = await newTabPage.evaluate(() => {
+    return {
+      hasTextarea: document.querySelector('textarea') !== null,
+      title: document.title,
+      hasHeaderTitle: (document.body.innerText || '').includes('TabPad'),
+      hasQuickMemo: (document.body.innerText || '').includes('빠른 메모'),
+      hasTodoList: (document.body.innerText || '').includes('할 일') || (document.body.innerText || '').includes('To-do'),
+    };
+  });
+
+  assert.equal(newTabRendered.hasTextarea, true, '새 탭 페이지에 메모장 textarea가 렌더링되어야 함');
+  assert.equal(newTabRendered.title, 'TabPad - 생산성 대시보드', '새 탭 페이지 타이틀이 올바르게 렌더링되어야 함');
+  assert.equal(newTabRendered.hasHeaderTitle, true, '새 탭 페이지에 TabPad 헤더가 표시되어야 함');
+  assert.equal(newTabRendered.hasQuickMemo, true, '새 탭 페이지에 빠른 메모 섹션이 렌더링되어야 함');
+  console.log('✓ 새 탭(chrome://newtab) 실제 URL 일치 및 대시보드 전체 렌더링 assert 통과');
+
+  await syncPageCspLog(newTabPage);
   await newTabPage.close();
 
-  assert.equal(manifest.chrome_url_overrides?.newtab, 'index.html', 'manifest.json에 newtab 오버라이드가 index.html로 등록되어 있어야 함');
-
-  // 대시보드 렌더링 확인
+  // 대시보드 메인 페이지 렌더링 확인
   await page1.waitForSelector('textarea', { timeout: 5000 });
   const pageTitle = await page1.evaluate(() => document.title);
-  console.log(`확장 페이지 타이틀: ${pageTitle}`);
+  console.log(`확장 메인 페이지 타이틀: ${pageTitle}`);
 
   // =========================================================================
   // 2단계: 실제 네이티브 localStorage 사용 및 UI 상호작용 검증 (메모리 모의 대체 0%)
@@ -214,6 +308,8 @@ try {
   assert.equal(reloadedData.isDarkClass, true, '새로고침 후 다크 모드가 유지되어야 함');
   console.log('✓ 새로고침 후 실제 네이티브 localStorage 및 UI 완전 유지 확인');
 
+  await syncPageCspLog(page1);
+
   // 브라우저 1차 종료
   await browser1.close();
   browser1 = null;
@@ -240,37 +336,20 @@ try {
     ],
   });
 
+  // ★ 요구사항 3 준수: 재시작 브라우저에서도 어떤 페이지도 로드되기 전 선제 CSP/에러 리스너 등록
+  setupPreNavigationCspCollector(browser2);
+
   const extensionId2 = await browser2.installExtension(asciiExtDir);
   console.log(`재시작 후 설치 확인된 확장 ID: ${extensionId2}`);
   assert.equal(extensionId2, extensionId, '동일한 프로필 및 동일 확장 경로에서 확장 프로그램 ID가 동일하게 유지되어야 함');
 
   await new Promise((r) => setTimeout(r, 2000));
 
-  const page2 = (await browser2.pages())[0] || await browser2.newPage();
-
-  page2.on('console', (msg) => {
-    if (msg.type() === 'error' && !msg.text().includes('favicon')) {
-      consoleErrors.push(msg.text());
-    }
-  });
-  page2.on('pageerror', (err) => {
-    runtimeErrors.push(err.message);
-  });
-
-  await page2.evaluateOnNewDocument(() => {
-    window.__cspViolations = [];
-    document.addEventListener('securitypolicyviolation', (e) => {
-      window.__cspViolations.push({
-        blockedURI: e.blockedURI,
-        violatedDirective: e.violatedDirective,
-        originalPolicy: e.originalPolicy,
-      });
-    });
-  });
+  const pages2 = await browser2.pages();
+  const page2 = pages2.length > 0 ? pages2[0] : await browser2.newPage();
 
   // 재시작 후 확장 페이지 열기
   await page2.goto(extensionPageUrl, { waitUntil: 'networkidle0', timeout: 15000 });
-
   await page2.waitForSelector('textarea', { timeout: 5000 });
 
   const restartedData = await page2.evaluate(() => {
@@ -294,55 +373,122 @@ try {
   console.log('✓ 브라우저 재시작 후 실제 디스크 영속성(Native LocalStorage Persistence) 100% 검증 통과!');
 
   // =========================================================================
-  // 5단계: 웹 대시보드 → 확장 프로그램 실제 JSON 내보내기/가져오기(Data Transfer) 검증
+  // 5단계: ★ 요구사항 2 준수: 웹 UI에서 직접 다운로드한 백업 파일을 확장으로 가져오는 전체 흐름 검증
   // =========================================================================
-  console.log('\n--- [5단계] 웹 대시보드 → 확장 프로그램 JSON 데이터 이전 E2E 검증 ---');
+  console.log('\n--- [5단계] 웹 UI에서 다운로드한 백업 파일을 확장 프로그램으로 가져오는 실환경 E2E 검증 ---');
 
-  // 웹 대시보드에서 내보낸 실제 JSON 백업 파일 데이터 준비
-  const webExportPayload = {
-    app: 'TabPad',
-    version: '1.0.0',
-    exportedAt: new Date().toISOString(),
-    origin: 'https://web-seven-wine-12.vercel.app',
-    data: {
-      tabpad_memo: '웹 대시보드(Vercel)에서 이전된 중요한 업무 메모',
-      tabpad_todos: [
-        { id: 9101, text: '웹에서 작성된 핵심 할 일', completed: false },
-        { id: 9102, text: '확장 프로그램 데이터 이전 확인', completed: true },
-      ],
-      tabpad_snippets: [
-        { id: 9201, title: '웹 고객 지원 문구', text: '안녕하십니까. TabPad 서비스팀입니다.' },
-      ],
-      tabpad_theme: 'dark',
-    },
-  };
+  // 5-1. 웹 대시보드 페이지 열기
+  const webPage = await browser2.newPage();
 
-  const backupFilePath = path.join(tempBase, `tabpad_backup_${Date.now()}.json`);
-  fs.writeFileSync(backupFilePath, JSON.stringify(webExportPayload, null, 2), 'utf8');
+  // 브라우저 다운로드 경로를 downloadDir로 지정
+  const cdpWebSession = await webPage.target().createCDPSession();
+  await cdpWebSession.send('Browser.setDownloadBehavior', {
+    behavior: 'allowAndName',
+    downloadPath: downloadDir,
+    eventsEnabled: true,
+  });
 
-  // 모달 열기 버튼 클릭
+  console.log(`웹 대시보드(${localWebUrl}) 접속 시작`);
+  await webPage.goto(localWebUrl, { waitUntil: 'networkidle0', timeout: 15000 });
+  await webPage.waitForSelector('textarea', { timeout: 5000 });
+
+  // 5-2. 웹 UI에서 데이터 직접 입력 (메모, 할 일, 상용구)
+  await webPage.evaluate(() => {
+    const memo = document.querySelector('textarea');
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    nativeSetter.call(memo, '웹 UI에서 사용자가 직접 작성하여 내보낸 핵심 업무 메모');
+    memo.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await new Promise((r) => setTimeout(r, 200));
+
+  await webPage.type('input[placeholder*="새로운 할 일"]', '웹 UI에서 생성된 투두 항목');
+  await webPage.evaluate(() => {
+    const addBtn = Array.from(document.querySelectorAll('button')).find((b) => (b.innerText || '').trim() === '추가');
+    if (addBtn) addBtn.click();
+  });
+  await new Promise((r) => setTimeout(r, 200));
+
+  await webPage.type('input[placeholder*="자주 쓰는 문구"]', '웹 UI에서 등록된 상용구 문구');
+  await webPage.evaluate(() => {
+    const addBtn = Array.from(document.querySelectorAll('button')).find((b) => (b.innerText || '').trim() === '등록');
+    if (addBtn) addBtn.click();
+  });
+  await new Promise((r) => setTimeout(r, 200));
+
+  // 5-3. 웹 UI의 '데이터 백업/이전' 모달 열기 및 'JSON 백업 내보내기' 버튼 클릭
+  console.log('웹 UI에서 [데이터 백업/이전] -> [JSON 백업 내보내기] 실행');
+  await webPage.evaluate(() => {
+    const modalBtn = Array.from(document.querySelectorAll('button')).find((b) => (b.innerText || '').includes('데이터 백업/이전'));
+    if (modalBtn) modalBtn.click();
+  });
+  await new Promise((r) => setTimeout(r, 200));
+
+  // 다운로드 시작 전 파일 목록 스냅샷
+  const beforeFiles = new Set(fs.readdirSync(downloadDir));
+
+  await webPage.evaluate(() => {
+    const exportBtn = Array.from(document.querySelectorAll('button')).find((b) => (b.innerText || '').includes('JSON 백업 내보내기'));
+    if (exportBtn) exportBtn.click();
+  });
+
+  // 5-4. 다운로드 디렉토리에 백업 JSON 파일이 실제로 다운로드 완료될 때까지 폴링 대기
+  let downloadedFilePath = null;
+  const pollStart = Date.now();
+  while (Date.now() - pollStart < 10000) {
+    const currentFiles = fs.readdirSync(downloadDir);
+    const newFile = currentFiles.find((f) => !beforeFiles.has(f) && (f.endsWith('.json') || !f.includes('.crdownload')));
+    if (newFile) {
+      const candidatePath = path.join(downloadDir, newFile);
+      if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).size > 10) {
+        downloadedFilePath = candidatePath;
+        break;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  assert.ok(downloadedFilePath, '웹 UI에서 [JSON 백업 내보내기] 클릭 시 파일이 실제 디스크에 다운로드되어야 함');
+  console.log(`✓ 웹 UI에서 다운로드 완료된 실제 백업 파일: ${downloadedFilePath}`);
+
+  const downloadedContent = JSON.parse(fs.readFileSync(downloadedFilePath, 'utf8'));
+  console.log('다운로드된 백업 파일 검증:', {
+    app: downloadedContent.app,
+    origin: downloadedContent.origin,
+    memoPreview: downloadedContent.data?.tabpad_memo?.slice(0, 30),
+  });
+  assert.equal(downloadedContent.app, 'TabPad');
+  assert.equal(downloadedContent.data.tabpad_memo, '웹 UI에서 사용자가 직접 작성하여 내보낸 핵심 업무 메모');
+
+  await syncPageCspLog(webPage);
+  await webPage.close();
+
+  // 5-5. 확장 프로그램 페이지로 이동하여 웹 UI에서 다운로드한 백업 파일을 실제로 가져오기
+  console.log('확장 프로그램 페이지에서 다운로드된 백업 파일 가져오기(Import) 수행');
+  await page2.bringToFront();
+
+  // '데이터 백업/이전' 모달 열기
   await page2.evaluate(() => {
     const modalBtn = Array.from(document.querySelectorAll('button')).find((b) => (b.innerText || '').includes('데이터 백업/이전'));
     if (modalBtn) modalBtn.click();
   });
   await new Promise((r) => setTimeout(r, 200));
 
-  // 모달 안내 문구 검증 (자동 이전 안 됨 및 출처 분리 안내)
+  // 출처 분리 안내 문구 검증
   const modalNoticeOk = await page2.evaluate(() => {
     const text = document.body.innerText || '';
     return text.includes('자동으로 이전되지 않습니다') && text.includes('저장 출처(Origin) 분리');
   });
   assert.equal(modalNoticeOk, true, '데이터 백업/이전 모달에 출처 분리 및 자동 이전 불가 안내가 명시되어야 함');
 
-  // file input에 백업 파일 업로드
+  // 웹 UI에서 다운로드받은 실제 파일 경로를 file input에 업로드
   const fileInput = await page2.$('input[type="file"]');
   assert.ok(fileInput, '파일 업로드 input이 존재해야 함');
-  await fileInput.uploadFile(backupFilePath);
+  await fileInput.uploadFile(downloadedFilePath);
 
   // UI 및 스토리지 반영 대기
-  await new Promise((r) => setTimeout(r, 800));
+  await new Promise((r) => setTimeout(r, 1000));
 
-  const transferredData = await page2.evaluate(() => {
+  const importedData = await page2.evaluate(() => {
     const preBackupKeys = Object.keys(window.localStorage).filter((k) => k.startsWith('tabpad_import_pre_backup_'));
     return {
       memo: window.localStorage.getItem('tabpad_memo'),
@@ -354,32 +500,40 @@ try {
     };
   });
 
-  try {
-    fs.unlinkSync(backupFilePath);
-  } catch {}
-
   assert.equal(
-    JSON.parse(transferredData.memo),
-    '웹 대시보드(Vercel)에서 이전된 중요한 업무 메모',
-    '웹에서 가져온 메모가 확장 프로그램의 localStorage에 복원되어야 함'
+    JSON.parse(importedData.memo),
+    '웹 UI에서 사용자가 직접 작성하여 내보낸 핵심 업무 메모',
+    '웹 UI에서 다운로드한 메모가 확장 프로그램의 localStorage에 복원되어야 함'
   );
   assert.equal(
-    transferredData.textareaVal,
-    '웹 대시보드(Vercel)에서 이전된 중요한 업무 메모',
+    importedData.textareaVal,
+    '웹 UI에서 사용자가 직접 작성하여 내보낸 핵심 업무 메모',
     '확장 프로그램 화면의 textarea가 웹 메모로 즉시 갱신되어야 함'
   );
-  assert.ok(transferredData.todos.includes('웹에서 작성된 핵심 할 일'), '웹 투두가 저장되어야 함');
-  assert.ok(transferredData.snippets.includes('안녕하십니까. TabPad 서비스팀입니다.'), '웹 상용구가 저장되어야 함');
-  assert.ok(transferredData.preBackupKeysCount >= 1, '가져오기 시 이전 데이터를 안전하게 보존하는 사전 백업 키가 생성되어야 함');
-  assert.ok(transferredData.bodyText.includes('성공적으로 가져왔습니다'), '성공 알림 메시지가 모달에 표시되어야 함');
-  console.log('✓ 웹 대시보드 → 확장 프로그램 실제 JSON 가져오기 및 사전 백업 생성 확인 완료');
+  assert.ok(importedData.todos.includes('웹 UI에서 생성된 투두 항목'), '웹 UI에서 생성된 투두 항목이 확장 프로그램에 복원되어야 함');
+  assert.ok(importedData.snippets.includes('웹 UI에서 등록된 상용구 문구'), '웹 UI에서 생성된 상용구가 확장 프로그램에 복원되어야 함');
+  assert.ok(importedData.preBackupKeysCount >= 1, '가져오기 시 이전 데이터를 안전하게 보존하는 사전 백업 키가 생성되어야 함');
+  assert.ok(importedData.bodyText.includes('성공적으로 가져왔습니다'), '성공 알림 메시지가 모달에 표시되어야 함');
+
+  console.log('✓ 웹 UI 다운로드 → 확장 프로그램 가져오기 전체 E2E 흐름 완벽 검증 통과');
+
+  await syncPageCspLog(page2);
 
   // =========================================================================
-  // 6단계: CSP 보안 정책 위반 및 런타임 에러 0건 최종 검증
+  // 6단계: ★ 요구사항 3 준수: 모든 페이지와 모든 탐색의 CSP 보안 정책 위반 및 오류 누적 최종 판정
   // =========================================================================
-  console.log('\n--- [6단계] CSP 정책 준수 및 런타임 콘솔/스크립트 무결성 검증 ---');
+  console.log('\n--- [6단계] 모든 페이지 및 탐색의 CSP 누적 위반 및 런타임 오류 최종 판정 ---');
 
-  const cspViolations = await page2.evaluate(() => window.__cspViolations || []);
+  console.log(`누적 수집된 CSP 위반 건수: ${globalCspViolations.length}건`);
+  console.log(`누적 수집된 콘솔 에러 건수: ${globalConsoleErrors.length}건`);
+  console.log(`누적 수집된 런타임 예외 건수: ${globalRuntimeErrors.length}건`);
+
+  assert.equal(
+    globalCspViolations.length,
+    0,
+    `초기 탭, 새 탭 오버라이드, 웹 대시보드, 확장 페이지, 브라우저 재시작을 포함한 모든 탐색에서 CSP 위반이 0건이어야 함 (발생: ${JSON.stringify(globalCspViolations)})`
+  );
+
   const hasAdSense = await page2.evaluate(() => {
     return document.body.innerText.includes('Google AdSense') || document.querySelector('.adsbygoogle') !== null;
   });
@@ -389,19 +543,18 @@ try {
       .filter((src) => typeof src === 'string' && (src.startsWith('http://') || src.startsWith('https://') || src.startsWith('//')));
   });
 
-  assert.equal(cspViolations.length, 0, `CSP 위반이 0건이어야 함 (발생: ${JSON.stringify(cspViolations)})`);
   assert.equal(hasAdSense, false, '확장 프로그램 내에는 AdSense 관련 UI나 코드가 절대 존재하지 않아야 함');
   assert.equal(remoteScripts.length, 0, '확장 프로그램 내에는 외부 원격 스크립트가 0건이어야 함');
-  assert.equal(runtimeErrors.length, 0, `런타임 오류가 0건이어야 함 (발생: ${JSON.stringify(runtimeErrors)})`);
-  assert.equal(consoleErrors.length, 0, `콘솔 에러가 0건이어야 함 (발생: ${JSON.stringify(consoleErrors)})`);
+  assert.equal(globalRuntimeErrors.length, 0, `모든 탐색에서 런타임 오류가 0건이어야 함 (발생: ${JSON.stringify(globalRuntimeErrors)})`);
+  assert.equal(globalConsoleErrors.length, 0, `모든 탐색에서 콘솔 에러가 0건이어야 함 (발생: ${JSON.stringify(globalConsoleErrors)})`);
 
-  console.log('✓ CSP 위반 0건, 런타임 오류 0건, 콘솔 에러 0건, AdSense/원격스크립트 0건 확인 완료');
+  console.log('✓ 전 과정 CSP 위반 0건, 런타임 오류 0건, 콘솔 에러 0건, AdSense/원격스크립트 0건 최종 확인 완료');
 
   await browser2.close();
   browser2 = null;
 
   console.log('\n=========================================================================');
-  console.log('★ [검증 완료] Google 공식 Puppeteer 기반 실환경 확장 프로그램 E2E 테스트 100% 통과!');
+  console.log('★ [검증 완료] 새 탭 오버라이드 assert, 웹 UI 다운로드→가져오기, 전과정 CSP 누적 판정 100% 통과!');
   console.log('=========================================================================');
 } finally {
   if (browser1) {
@@ -410,7 +563,11 @@ try {
   if (browser2) {
     try { await browser2.close(); } catch {}
   }
-  // 이번 테스트 실행에서 생성한 고유 폴더만 정리
+  try {
+    webServer.close();
+  } catch {}
+
+  // 이번 테스트 실행에서 생성한 고유 임시 디렉토리만 안전하게 정리
   for (const dir of createdDirsToCleanup) {
     try {
       if (fs.existsSync(dir)) {
