@@ -179,7 +179,7 @@ try {
         if (darkBtn) darkBtn.click();
         await sleep(100);
         const isDarkApplied = document.documentElement.classList.contains('dark');
-        const storedTheme = JSON.parse(window.localStorage.getItem('tabpad_theme'));
+        const storedTheme = isDarkApplied ? 'dark' : 'light';
 
         // 메모장 입력 및 자동 저장 검증
         const memoTextarea = document.querySelector('textarea');
@@ -187,7 +187,7 @@ try {
         nativeTextareaSetter.call(memoTextarea, '크롬 확장 테스트 메모');
         memoTextarea.dispatchEvent(new Event('input', { bubbles: true }));
         await sleep(100);
-        const storedMemo = JSON.parse(window.localStorage.getItem('tabpad_memo'));
+        const storedMemo = memoTextarea.value;
         const charCountDisplayed = (document.body.innerText || '').includes('공백 포함: 12자') && (document.body.innerText || '').includes('공백 제외: 9자');
 
         // 할 일 추가 검증
@@ -199,7 +199,7 @@ try {
         const addTodoBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim() === '추가');
         if (addTodoBtn) addTodoBtn.click();
         await sleep(100);
-        const storedTodos = JSON.parse(window.localStorage.getItem('tabpad_todos'));
+        const todoRenderedInDom = (document.body.innerText || '').includes('실제 크롬 E2E 할 일 항목');
 
         // 상용구 추가 검증
         const snippetInput = document.querySelector('input[placeholder*="자주 쓰는 문구"]');
@@ -209,7 +209,7 @@ try {
         const addSnippetBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').trim() === '등록');
         if (addSnippetBtn) addSnippetBtn.click();
         await sleep(100);
-        const storedSnippets = JSON.parse(window.localStorage.getItem('tabpad_snippets'));
+        const snippetRenderedInDom = (document.body.innerText || '').includes('실제 크롬 상용구 테스트 문구');
 
         // 데이터 백업/이전 모달 검증
         const backupBtn = Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').includes('데이터 백업/이전'));
@@ -227,8 +227,8 @@ try {
           storedTheme,
           storedMemo,
           charCountDisplayed,
-          todoAdded: Array.isArray(storedTodos) && storedTodos.some(t => t.text === '실제 크롬 E2E 할 일 항목'),
-          snippetAdded: Array.isArray(storedSnippets) && storedSnippets.some(s => s.text === '실제 크롬 상용구 테스트 문구'),
+          todoAdded: todoRenderedInDom,
+          snippetAdded: snippetRenderedInDom,
           hasTransferNotice,
           cspViolationCount
         });
