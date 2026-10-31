@@ -131,114 +131,130 @@ const negativeCspViolations = [];
 const negativeConsoleErrors = [];
 const negativeRuntimeErrors = [];
 
-// 중복 등록 방지를 위한 WeakSet
-const attachedPages = new WeakSet();
+// ★ 요구사항 준수: WeakSet 대신 WeakMap<Page, Promise>에 등록 작업을 저장하여 동시 호출 대기 및 동일 Promise 반환 보장
+const collectorPromises = new WeakMap();
+
+// 테스트 목적의 의도적 지연 설정 변수 (밀리초)
+let attachDelayMs = 0;
 
 /**
- * ★ 요구사항 1 & 2 준수: 기존 페이지와 새 페이지 모두에 공통 attachCollector(page) 적용
- * CSP 이벤트 발생 즉시 Node 측 누적 저장소로 전달하며 수집 실패를 조용히 무시하지 않음
+ * ★ 요구사항 준수: 기존 페이지와 새 페이지 모두에 공통 attachCollector(page) 적용
+ * 같은 페이지의 모든 동시 호출이 동일한 Promise를 반환하며, 등록 완료 전까지 대기하도록 보장
+ * 등록 실패 또한 모든 호출자에게 Rejection으로 정확히 전달됨
  */
-async function attachCollector(page) {
-  if (!page || attachedPages.has(page)) {
-    return;
+function attachCollector(page) {
+  if (!page) {
+    return Promise.resolve();
   }
-  attachedPages.add(page);
+  if (collectorPromises.has(page)) {
+    return collectorPromises.get(page);
+  }
 
-  // 1. 콘솔 에러 리스너
-  page.on('console', (msg) => {
-    if (msg.type() === 'error' && !msg.text().includes('favicon')) {
-      const entry = {
-        url: page.url(),
-        text: msg.text(),
-        location: msg.location(),
-        timestamp: Date.now(),
-      };
-      if (collectorMode === 'negative_test') {
-        negativeConsoleErrors.push(entry);
-      } else {
-        globalConsoleErrors.push(entry);
-      }
+  const registrationPromise = (async () => {
+    // 의도적 지연 테스트 지원
+    if (attachDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, attachDelayMs));
     }
-  });
 
-  // 2. 런타임 페이지 에러 리스너
-  page.on('pageerror', (err) => {
-    const entry = {
-      url: page.url(),
-      message: err.message,
-      stack: err.stack,
-      timestamp: Date.now(),
-    };
-    if (collectorMode === 'negative_test') {
-      negativeRuntimeErrors.push(entry);
-    } else {
-      globalRuntimeErrors.push(entry);
-    }
-  });
-
-  // 3. 브라우저 페이지 크래시 에러 리스너
-  page.on('error', (err) => {
-    const entry = {
-      url: page.url(),
-      message: `[Page Crash] ${err.message}`,
-      timestamp: Date.now(),
-    };
-    if (collectorMode === 'negative_test') {
-      negativeRuntimeErrors.push(entry);
-    } else {
-      globalRuntimeErrors.push(entry);
-    }
-  });
-
-  // 4. CSP 이벤트 발생 즉시 Node로 전달하는 바인딩 함수 등록 (수집 실패를 무시하지 않음)
-  try {
-    await page.exposeFunction('__tabpadReportCspViolation', (violation) => {
-      const entry = {
-        blockedURI: violation.blockedURI,
-        violatedDirective: violation.violatedDirective,
-        originalPolicy: violation.originalPolicy,
-        documentURI: violation.documentURI,
-        effectiveDirective: violation.effectiveDirective,
-        timestamp: Date.now(),
-      };
-      if (collectorMode === 'negative_test') {
-        negativeCspViolations.push(entry);
-      } else {
-        globalCspViolations.push(entry);
+    // 1. 콘솔 에러 리스너
+    page.on('console', (msg) => {
+      if (msg.type() === 'error' && !msg.text().includes('favicon')) {
+        const entry = {
+          url: typeof page.url === 'function' ? page.url() : '',
+          text: msg.text(),
+          location: typeof msg.location === 'function' ? msg.location() : undefined,
+          timestamp: Date.now(),
+        };
+        if (collectorMode === 'negative_test') {
+          negativeConsoleErrors.push(entry);
+        } else {
+          globalConsoleErrors.push(entry);
+        }
       }
     });
-  } catch (err) {
-    if (!err.message.includes('already exists')) {
-      console.error('CSP exposeFunction 등록 실패:', err);
-      throw new Error(`CSP exposeFunction 바인딩 실패: ${err.message}`);
-    }
-  }
 
-  // 5. evaluateOnNewDocument로 문서 파싱/스크립트 실행 전 securitypolicyviolation 리스너 주입
-  try {
-    await page.evaluateOnNewDocument(() => {
-      document.addEventListener('securitypolicyviolation', (e) => {
-        try {
-          if (typeof window.__tabpadReportCspViolation === 'function') {
-            window.__tabpadReportCspViolation({
-              blockedURI: e.blockedURI,
-              violatedDirective: e.violatedDirective,
-              originalPolicy: e.originalPolicy,
-              documentURI: document.documentURI,
-              effectiveDirective: e.effectiveDirective,
-            });
-          } else {
-            console.error('CSP 위반 전달 함수(__tabpadReportCspViolation)가 준비되지 않음');
-          }
-        } catch (dispatchErr) {
-          console.error('CSP 위반 Node 전달 중 예외 발생:', dispatchErr);
+    // 2. 런타임 페이지 에러 리스너
+    page.on('pageerror', (err) => {
+      const entry = {
+        url: typeof page.url === 'function' ? page.url() : '',
+        message: err.message,
+        stack: err.stack,
+        timestamp: Date.now(),
+      };
+      if (collectorMode === 'negative_test') {
+        negativeRuntimeErrors.push(entry);
+      } else {
+        globalRuntimeErrors.push(entry);
+      }
+    });
+
+    // 3. 브라우저 페이지 크래시 에러 리스너
+    page.on('error', (err) => {
+      const entry = {
+        url: typeof page.url === 'function' ? page.url() : '',
+        message: `[Page Crash] ${err.message}`,
+        timestamp: Date.now(),
+      };
+      if (collectorMode === 'negative_test') {
+        negativeRuntimeErrors.push(entry);
+      } else {
+        globalRuntimeErrors.push(entry);
+      }
+    });
+
+    // 4. CSP 이벤트 발생 즉시 Node로 전달하는 바인딩 함수 등록 (수집 실패를 무시하지 않음)
+    try {
+      await page.exposeFunction('__tabpadReportCspViolation', (violation) => {
+        const entry = {
+          blockedURI: violation.blockedURI,
+          violatedDirective: violation.violatedDirective,
+          originalPolicy: violation.originalPolicy,
+          documentURI: violation.documentURI,
+          effectiveDirective: violation.effectiveDirective,
+          timestamp: Date.now(),
+        };
+        if (collectorMode === 'negative_test') {
+          negativeCspViolations.push(entry);
+        } else {
+          globalCspViolations.push(entry);
         }
       });
-    });
-  } catch (err) {
-    console.error('CSP evaluateOnNewDocument 등록 실패:', err);
-    throw new Error(`CSP evaluateOnNewDocument 주입 실패: ${err.message}`);
-  }
+    } catch (err) {
+      if (!err.message.includes('already exists')) {
+        console.error('CSP exposeFunction 등록 실패:', err);
+        throw new Error(`CSP exposeFunction 바인딩 실패: ${err.message}`);
+      }
+    }
+
+    // 5. evaluateOnNewDocument로 문서 파싱/스크립트 실행 전 securitypolicyviolation 리스너 주입
+    try {
+      await page.evaluateOnNewDocument(() => {
+        document.addEventListener('securitypolicyviolation', (e) => {
+          try {
+            if (typeof window.__tabpadReportCspViolation === 'function') {
+              window.__tabpadReportCspViolation({
+                blockedURI: e.blockedURI,
+                violatedDirective: e.violatedDirective,
+                originalPolicy: e.originalPolicy,
+                documentURI: document.documentURI,
+                effectiveDirective: e.effectiveDirective,
+              });
+            } else {
+              console.error('CSP 위반 전달 함수(__tabpadReportCspViolation)가 준비되지 않음');
+            }
+          } catch (dispatchErr) {
+            console.error('CSP 위반 Node 전달 중 예외 발생:', dispatchErr);
+          }
+        });
+      });
+    } catch (err) {
+      console.error('CSP evaluateOnNewDocument 등록 실패:', err);
+      throw new Error(`CSP evaluateOnNewDocument 주입 실패: ${err.message}`);
+    }
+  })();
+
+  collectorPromises.set(page, registrationPromise);
+  return registrationPromise;
 }
 
 /**
@@ -290,6 +306,94 @@ try {
   for (const p of initialPages1) {
     await attachCollector(p);
   }
+
+  // =========================================================================
+  // ★ 요구사항 준수: [동시 호출 검증] WeakMap<Page, Promise> 기반 동시 호출 대기 및 동일 Promise 반환 검증
+  // =========================================================================
+  console.log('\n--- [동시 호출 검증] attachCollector 동시 호출 대기 및 동일 Promise 반환/실패 전파 검증 ---');
+
+  // 1) 첫 등록을 의도적으로 지연시킨 뒤 두 번째 호출도 완료 전까지 대기하는지 검증
+  const concurrentMockPage = {
+    on(_event, _handler) {},
+    url() {
+      return 'chrome-extension://test/index.html';
+    },
+    async exposeFunction(_name, _fn) {},
+    async evaluateOnNewDocument(_fn) {},
+  };
+
+  attachDelayMs = 250; // 250ms 의도적 지연 설정
+
+  let call1Finished = false;
+  let call2Finished = false;
+  const startTime = Date.now();
+
+  const promise1 = attachCollector(concurrentMockPage);
+  promise1.then(() => {
+    call1Finished = true;
+  });
+
+  // 첫 번째 등록이 진행 중인 상태에서 두 번째 호출
+  const promise2 = attachCollector(concurrentMockPage);
+  promise2.then(() => {
+    call2Finished = true;
+  });
+
+  // 같은 페이지의 모든 호출이 동일한 Promise 인스턴스를 반환하는지 assert
+  assert.equal(promise1, promise2, '동일 페이지에 대한 동시 attachCollector 호출은 완전히 동일한 Promise 인스턴스를 반환해야 함');
+  assert.equal(collectorPromises.get(concurrentMockPage), promise1, 'WeakMap에 저장된 단일 Promise가 반환되어야 함');
+
+  // 첫 등록이 지연 중이므로 아직 완료되지 않았어야 함
+  assert.equal(call1Finished, false, '첫 등록이 지연 중이므로 첫 번째 호출은 아직 완료되지 않아야 함');
+  assert.equal(call2Finished, false, '두 번째 호출도 첫 등록이 완료되기 전까지 대기해야 함');
+
+  // 두 호출이 모두 완료될 때까지 대기
+  await Promise.all([promise1, promise2]);
+  const elapsed = Date.now() - startTime;
+
+  assert.equal(call1Finished, true, '첫 번째 호출이 완료되어야 함');
+  assert.equal(call2Finished, true, '두 번째 호출도 함께 완료되어야 함');
+  assert.ok(elapsed >= 200, `첫 등록 지연(250ms) 동안 두 번째 호출도 완료 전까지 대기했어야 함 (경과: ${elapsed}ms)`);
+  console.log(`✓ attachCollector 동시 호출 대기 및 동일 Promise 반환 확인 완료 (경과: ${elapsed}ms, 완료 동기화 일치)`);
+
+  attachDelayMs = 0; // 지연 해제
+
+  // 실제 Puppeteer Page에 대해서도 동일 Promise 반환 검증
+  const realTestPage = await browser1.newPage();
+  const realP1 = attachCollector(realTestPage);
+  const realP2 = attachCollector(realTestPage);
+  assert.equal(realP1, realP2, '실제 Puppeteer Page에 대해서도 attachCollector 호출 시 동일한 Promise를 반환해야 함');
+  await realP1;
+  await realTestPage.close();
+
+  // 2) 등록 실패 시 모든 호출자에게 Rejection이 전달되는지 검증
+  const failureMockPage = {
+    on() {
+      throw new Error('의도된 attachCollector 등록 실패 테스트 오류');
+    },
+  };
+
+  const failPromise1 = attachCollector(failureMockPage);
+  const failPromise2 = attachCollector(failureMockPage);
+  assert.equal(failPromise1, failPromise2, '실패하는 경우에도 동일한 Promise 인스턴스 반환');
+
+  let error1 = null;
+  let error2 = null;
+  try {
+    await failPromise1;
+  } catch (err) {
+    error1 = err;
+  }
+  try {
+    await failPromise2;
+  } catch (err) {
+    error2 = err;
+  }
+
+  assert.ok(error1 && error1.message.includes('의도된 attachCollector 등록 실패 테스트 오류'), '첫 번째 호출자에게 등록 실패 에러가 전달되어야 함');
+  assert.ok(error2 && error2.message.includes('의도된 attachCollector 등록 실패 테스트 오류'), '두 번째 호출자에게도 동일한 등록 실패 에러가 전달되어야 함');
+  assert.equal(error1, error2, '모든 호출자가 동일한 Rejection 에러 인스턴스를 공유해야 함');
+  console.log('✓ attachCollector 등록 실패 시 모든 동시 호출자에게 동일 Rejection 전달 확인 완료');
 
   // =========================================================================
   // ★ 요구사항 3 준수: [부정 검증] 의도적 CSP 위반과 런타임 오류 검출 능력 실환경 검증
@@ -751,7 +855,7 @@ try {
   browser2 = null;
 
   console.log('\n=========================================================================');
-  console.log('★ [검증 완료] 공통 attachCollector, 즉시 Node 전달, 부정/제품 검증 분리 E2E 100% 통과!');
+  console.log('★ [검증 완료] WeakMap 동시 대기·동일 Promise 반환, 부정/제품 검증 분리 E2E 100% 통과!');
   console.log('=========================================================================');
 } finally {
   if (browser1) {
